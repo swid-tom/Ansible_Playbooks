@@ -1,0 +1,19 @@
+---
+- name: Validate connectivity to Cisco Network Switch
+  hosts: nxos
+  gather_facts: True
+  tasks:
+    - name: Dump gathered facts
+      ansible.builtin.debug:
+        var: ansible_facts
+
+    - name: Gather show interface status command
+      cisco.nxos.nxos_command:
+        commands:
+          - "show interface status"
+      register: command_output
+
+    - name: Dump command output
+      ansible.builtin.debug:
+        msg: "{{ item }}"
+      loop: "{{ command_output.stdout_lines }}"

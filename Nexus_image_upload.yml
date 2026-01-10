@@ -1,0 +1,324 @@
+---
+- name: Stage NX-OS (and optional EPLD) images on Nexus via filename with MD5 verification
+  hosts: "{{ survey_hosts }}"
+  serial: 2   # Ensures two switches at a time
+  gather_facts: no
+  collections:
+    - cisco.nxos
+
+  # Recommended to pass these via Tower/AWX Survey (or inventory/group vars)
+
+  pre_tasks:
+    - name: Build source/destination paths for NX-OS
+      set_fact:
+        nxos_local_file:  "{{ nxos_image_filename }}"
+        nxos_remote_file: "{{ image_dir_on_sftp + nxos_image_filename }}"
+
+    - name: List bootflash for NX-OS images
+      nxos_command:
+        commands:
+          - "dir bootflash:"
+      register: bootflash_dir      
+
+#    - name: Debug bootflash_dir.stout
+#      debug:
+#        var: bootflash_dir.stdout_lines
+
+    - name: Build bootflash_output from dir listing
+      set_fact:
+        bootflash_output: "{{ bootflash_dir.stdout_lines | default([]) | join('\n') }}"        
+
+    - name: Extract NX-OS .bin files found in bootflash
+      set_fact:
+        nxos_bins_present: "{{ bootflash_output | regex_findall('nxos\\S*?\\.bin') | unique }}"
+
+    - name: Determine if exact target image exists already
+      set_fact:
+        same_file_present: "{{ nxos_image_filename in (nxos_bins_present | default([])) }}"
+
+    - name: Extract numeric version triplets from filenames in bootflash (e.g., 10.4.5 -> [10,4,5])
+      set_fact:
+        present_versions: []
+
+    - name: Build present_versions list
+      set_fact:
+        present_versions: >-
+          {{ 
+            present_versions 
+            + [ 
+                (
+                  (
+                    item | regex_search('([0-9]+(?:\.[0-9]+){2})')
+                    if (item | regex_search('([0-9]+(?:\.[0-9]+){2})') is not none)
+                    else '0.0.0'
+                  )
+                  | split('.')
+                  | map('int')
+                  | list
+                )
+              ]
+          }}
+      loop: "{{ nxos_bins_present | default([]) }}"
+
+    - name: Extract target version parts from the provided filename
+      set_fact:
+        target_version_parts: >-
+          {{
+            (
+              (
+                nxos_image_filename | regex_search('([0-9]+(?:\.[0-9]+){2})')
+                if (nxos_image_filename | regex_search('([0-9]+(?:\.[0-9]+){2})') is not none)
+                else '0.0.0'
+              )
+              | split('.')
+              | map('int')
+              | list
+            )
+          }}
+
+    - name: Compute highest version present in bootflash (lexicographic on [major,minor,patch])
+      set_fact:
+        max_present_version: "{{ (present_versions | length > 0) | ternary(present_versions | max, [0,0,0]) }}"
+
+    - name: Mark if newer image is present
+      set_fact:
+        newer_present: "{{ max_present_version > target_version_parts }}"
+
+    - name: Show what we found
+      debug:
+        msg:
+          - "Target filename: {{ nxos_image_filename }}"
+          - "Target version parts: {{ target_version_parts }}"
+          - "NX-OS images in bootflash: {{ nxos_bins_present | default([]) }}"
+          - "Highest version present: {{ max_present_version }}"
+          - "Exact file present? {{ same_file_present }}"
+          - "A newer image than target already present? {{ newer_present }}"
+
+  tasks:
+    - name: Skip copy because a newer image already exists in bootflash
+      when: newer_present
+      debug:
+        msg: >-
+          Skipping copy: a newer NX-OS image (version parts {{ max_present_version }})
+          is already present in bootflash. Target is {{ target_version_parts }}.
+
+    - name: If exact file exists, compute its MD5 for validation
+      when: same_file_present
+      nxos_command:
+        commands:
+          - "show file {{ nxos_image_filename }} md5"
+      register: existing_md5_check
+
+    - name: Extract existing file MD5 (if present)
+      when: same_file_present and existing_md5_check.stdout is defined
+      set_fact:
+        existing_md5_actual: "{{ (existing_md5_check.stdout[0] | regex_search('([a-fA-F0-9]{32})')) }}"
+
+    - name: Decide if we must re-copy due to MD5 mismatch
+      set_fact:
+        force_recopy_due_to_md5: "{{ same_file_present and (existing_md5_actual | default('') | lower != expected_md5 | lower) }}"
+
+    - name: Fail early if MD5 mismatch and newer image exists (won't overwrite)
+      when: newer_present and force_recopy_due_to_md5
+      fail:
+        msg: >-
+          Exact file exists but MD5 mismatches; however a NEWER image already exists in bootflash.
+          To keep storage sane, not overwriting older target when a newer image is present.
+          Existing MD5: {{ existing_md5_actual | default('unknown') }}, expected {{ expected_md5 }}.
+
+    - name: Decide if we need to copy the NX-OS image
+      set_fact:
+        nxos_copy_needed: "{{ (not newer_present) and ( (not same_file_present) or force_recopy_due_to_md5 ) }}"
+        nxos_overwrite: "{{ force_recopy_due_to_md5 }}"
+
+    - name: Get list of VRFs on Nexus
+      nxos_command:
+        commands:
+          - "show vrf"
+      register: vrf_list
+   
+    - name: Set fact if mgmt VRF exists
+      set_fact:
+        mgmt_vrf_exists: "{{ 'mgmt' in (vrf_list.stdout[0] | lower) }}"
+
+    - name: Set VRF to use for copy
+      set_fact:
+        vrf_to_use: "{{ 'mgmt' if mgmt_vrf_exists else 'management' }}" 
+
+    - name: Debug VRF value
+      debug:
+        msg:
+        - "vrf: {{ vrf_to_use }}"
+
+    - name: Copy NX-OS image from SFTP via SCP to bootflash (device-initiated)
+      when: nxos_copy_needed
+      nxos_file_copy:
+        file_pull: true
+        local_file: "{{ nxos_image_filename }}"    # destination on Nexus bootflash
+        remote_file: "{{ nxos_remote_file }}"  #  path on SFTP/SCP server
+        remote_scp_server: "{{ sftp_server }}"
+        remote_scp_server_user: "{{ sftp_username }}"
+        remote_scp_server_password: "{{ sftp_password }}"
+        file_pull_timeout: 1800        
+        vrf: "{{ vrf_to_use }}"
+      register: nxos_copy_result
+
+    - name: Show NX-OS copy result
+      when: nxos_copy_needed
+      debug:
+        var: nxos_copy_result
+
+    - name: Fail clearly on NX-OS copy errors
+      when: nxos_copy_needed and (nxos_copy_result is defined) and (nxos_copy_result.failed | default(false))
+      fail:
+        msg: >-
+          Device-initiated copy failed.
+          result={{ nxos_copy_result | to_nice_json }}
+
+    - name: Compute MD5 of target NX-OS image on device (post-copy or if already present)
+      when: (nxos_copy_needed) or (same_file_present and not newer_present)
+      nxos_command:
+        commands:
+          - "show file {{ nxos_image_filename }} md5"
+      register: nxos_md5_check
+
+    - name: Extract NX-OS MD5 and validate
+      when: (nxos_copy_needed) or (same_file_present and not newer_present)
+      block:
+        - set_fact:
+            nxos_md5_actual: "{{ (nxos_md5_check.stdout[0] | regex_search('([a-fA-F0-9]{32})')) }}"
+        - assert:
+            that:
+              - nxos_md5_actual is defined
+              - nxos_md5_actual | lower == expected_md5 | lower
+            fail_msg: "NX-OS MD5 mismatch! Expected {{ expected_md5 }}, got {{ nxos_md5_actual }}"
+            success_msg: "NX-OS MD5 verified: {{ nxos_md5_actual }}"
+
+    # ------------------ Optional EPLD handling ------------------
+    - name: Optional EPLD staging block
+      when: upload_epld | lower == 'yes'
+      block:
+        - name: Build EPLD paths
+          set_fact:
+            epld_local_file:  "{{ epld_filename }}"
+            epld_remote_file: "{{ epld_dir_on_sftp + epld_filename }}"
+
+        - name: Check if EPLD exists in bootflash
+          nxos_command:
+            commands:
+              - "dir bootflash: | include {{ epld_filename }}"
+          register: epld_dir
+
+        - name: Mark EPLD presence
+          set_fact:
+            epld_present: "{{ (epld_dir.stdout | join('')) | length > 0 }}"
+
+        - name: If present, compute EPLD MD5
+          when: epld_present
+          nxos_command:
+            commands:
+              - "show file {{ epld_filename }} md5"
+          register: epld_md5_show
+
+        - name: Extract existing EPLD MD5
+          when: epld_present and epld_md5_show.stdout is defined
+          set_fact:
+            epld_md5_actual: "{{ (epld_md5_show.stdout[0] | regex_search('([a-fA-F0-9]{32})')) }}"
+
+        - name: Determine if EPLD needs copy (missing or MD5 mismatch)
+          set_fact:
+            epld_copy_needed: "{{ (not epld_present) or (epld_md5_actual | default('') | lower != epld_md5 | lower) }}"
+            epld_overwrite: "{{ epld_present and (epld_md5_actual | default('') | lower != epld_md5 | lower) }}"
+
+        - name: Copy EPLD image (device-initiated)
+          when: epld_copy_needed
+          nxos_file_copy:
+            file_pull: true
+            local_file: "{{ epld_filename }}"    # destination on Nexus bootflash
+            remote_file: "{{ epld_remote_file }}"  #  path on SFTP/SCP server
+            remote_scp_server: "{{ sftp_server }}"
+            remote_scp_server_user: "{{ sftp_username }}"
+            remote_scp_server_password: "{{ sftp_password }}"
+            file_pull_timeout: 1800        
+            vrf: "{{ vrf_to_use }}"
+          register: epld_copy_result
+
+        - name: Show EPLD copy result
+          when: epld_copy_needed
+          debug:
+            var: epld_copy_result
+
+        - name: Fail clearly on EPLS copy errors
+          when: epld_copy_needed and (epld_copy_result is defined) and (epld_copy_result.failed | default(false))
+          fail:
+            msg: >-
+              Device-initiated copy failed.
+              result={{ nepld_copy_result | to_nice_json }}
+
+        - name: Validate EPLD MD5 after copy (or when present)
+          nxos_command:
+            commands:
+              - "show file {{ epld_filename }} md5"
+          register: epld_md5_post
+
+        - name: Extract and assert EPLD MD5
+          set_fact:
+            epld_md5_final: "{{ (epld_md5_post.stdout[0] | regex_search('([a-fA-F0-9]{32})')) }}"
+        - assert:
+            that:
+              - epld_md5_final is defined
+              - epld_md5_final | lower == epld_md5 | lower
+            fail_msg: "EPLD MD5 mismatch! Expected {{ epld_md5 }}, got {{ epld_md5_final }}"
+            success_msg: "EPLD MD5 verified: {{ epld_md5_final }}"
+
+  post_tasks:
+    - name: Initialize summary list
+      set_fact:
+         device_summary_list: []
+      run_once: true
+
+    - name: Build per-host summary entry
+      set_fact:
+        device_summary_entry:
+          Device: "{{ inventory_hostname }}"
+          NX-OS filename: "{{ nxos_image_filename }}"
+          Target version: "{{ target_version_parts | join('.') }}"
+          Same file present?: "{{ same_file_present }}"
+          Newer present?: "{{ newer_present }}"
+          Highest Version found?: "{{ max_present_version | join('.') }}"
+          Copy performed?: "{{ nxos_copy_needed | default(false) }}"
+          EPLD enabled?: "{{ upload_epld }}"
+          EPLD filename: "{{ (upload_epld | lower == 'yes') | ternary(epld_filename, 'N/A') }}"
+
+    - name: Append this device to runtime summary list
+      set_fact:
+        device_summary_list: >-
+          {{
+            (device_summary_list | default([]))
+            + [ device_summary_entry ]
+          }}
+
+    - name: Append to Tower job artifact aggregated #Optional - use with API
+      set_stats:
+        data:
+          device_summary: >-
+            {{
+              (device_summary | default([]))
+              + [ device_summary_entry ]
+            }}
+        aggregate: yes
+        per_host: false
+
+    - name: Show all device summaries in single print
+      debug:
+        msg: >-
+          {{
+            groups['all']
+            | map ('extract', hostvars, 'device_summary_entry')
+            | select('defined')
+            | list
+            | to_nice_json 
+          }}
+      run_once: true
+      delegate_to: localhost
+

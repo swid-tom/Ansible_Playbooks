@@ -1,0 +1,66 @@
+---
+- name: Git clone on localhost
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Create new directory
+      file:
+        path: /tmp/test
+        state: directory
+        mode: '0777'
+
+### Need to enter your GIT REPO url in <<GIT_URL>>
+    - name: Clone from Gitlab
+      git:
+        repo: 'https://{{ansible_user | urlencode}}:{{ansible_password | urlencode}}@s<<GIT_URL>>git'
+        dest: /tmp/test
+        accept_hostkey: yes
+        clone: yes
+        update: yes
+      environment:
+        GIT_SSL_NO_VERIFY: "true"
+
+- name: config backup of network devices
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: backup ios config
+      ios_config:
+       backup: yes
+       backup_options:
+         filename: "running-config-{{ inventory_hostname }}.cfg"
+         dir_path: "/tmp/test/backups/cisco/ios/{{ inventory_hostname }}" 
+
+      when: ansible_network_os == 'cisco.ios.ios'
+    - name: backup nxos config
+      nxos_config:
+       backup: yes
+       backup_options:
+         filename: "running-config-{{ inventory_hostname }}.cfg"
+         dir_path: "/tmp/test/backups/cisco/nxos/{{ inventory_hostname }}"
+
+      when: ansible_network_os == 'cisco.nxos.nxos'
+
+- name: Git push from locahost to Gitlab
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: get timestamp
+      command: date +%Y-%m-%d
+      register: timestamp
+
+    - name: User name
+      shell: git config --global user.name "awx"
+
+    - name: Email
+      shell: git config --global user.email "awx@natfuel.com"
+
+    - name: Push to Gitlab
+      shell: | 
+        cd /tmp/test/backups/cisco
+        git add . 
+        git commit -m "{{ timestamp.stdout }}"
+        git push origin main
+      environment:
+        GIT_SSL_NO_VERIFY: "true"
+
