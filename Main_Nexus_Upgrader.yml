@@ -1,0 +1,748 @@
+
+---
+# ############################################################################
+# NEXUS vPC PAIR ORCHESTRATED UPGRADE PLAYBOOK
+# ############################################################################
+#
+# PURPOSE:
+#   This playbook discovers vPC pairs from Cisco Nexus switches, validates
+#   their roles (primary/secondary), backs up configs, then orchestrates
+#   a primary-first upgrade with health checks and detailed reporting.
+#
+# KEY CONCEPTS:
+#   - vPC Pair: Two Nexus switches in an NX-OS vPC domain (one primary, one secondary)
+#   - Discovery: Uses 'show vpc role' to extract local/peer MAC addresses
+#   - Pairing: Computes reciprocal MAC matches to build pairs from inventory
+#   - Upgrade Order: Primary always upgraded first, then secondary
+#   - Health Checks: Retries vPC convergence until peer adjacency is stable
+#   - Reporting: Captures interface snapshots pre/post upgrade, generates report
+#   - Publishing: Optionally publishes report + snapshots to Git and/or email
+#
+# WORKFLOW:
+#   1. Per-host discovery: each device runs 'show vpc role' to extract MACs
+#   2. Pair computation: controller-side (localhost) matches MACs reciprocally
+#   3. Config backup: all devices save running-config to startup-config
+#   4. Per-pair upgrade loop: for each pair, execute Upgrade_Workflow.yml
+#      - Primary upgrade + health check + interface snapshot
+#      - Secondary upgrade + health check + interface snapshot
+#   5. Report generation: merge per-pair stats, format as table or JSON
+#   6. Git publish: optionally push report + snapshots to repository
+#   7. Email delivery: optionally send report via SMTP
+#
+# ############################################################################
+
+- name: Discover vPC pairs from 'show vpc role' and validate
+  hosts: "{{ survey_hosts }}"
+  gather_facts: no
+  connection: ansible.netcommon.network_cli
+
+  vars:
+    # === Images & toggles ===
+    # Controls which image components to install on each device
+    update_epld: "{{ epld_value | lower == 'true' or epld_value == '1' }}"  # set true to include EPLD in install
+    nxos_image: "{{ nxos_image_filename }}"
+    epld_image: "{{ epld_filename }}"   # required only if update_epld=true
+    issu: "{{ issu_enabled | lower == 'true' or epld_value == '1' }}"
+
+    # === Orchestration / Timing ===
+    # These control how the upgrade workflow waits for device recovery
+    wait_timeout_sec: 1200                    # max wait for device to come back (default: 20 min)
+    settle_seconds: 60                        # brief pause after SSH returns and before health checks
+    halt_on_failure: true                     # stop after a failed pair; set false to continue with remaining pairs
+
+    # === Reporting / Snapshots ===
+    # Report generation and optional file preservation
+    report_dir: "/tmp"                                                       # AAP executor's temp directory
+    report_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"   # frozen at start of play
+    report_file: "vpc_upgrade_report_{{ report_timestamp }}.txt"
+    save_snapshot_files: false                # save interface snapshots to separate files (Git integration)
+    report_snapshot_view: "table"             # output format: 'table' (human-readable) or 'json' (machine-readable)
+    
+    # === Optional Email Publishing ===
+    # Enable send_email_report to email the final report. SMTP credentials are optional.
+    # For unauthenticated relay (port 25): supply smtp_host, mail_from, mail_to only
+    # For authenticated relay (port 587): supply all five vars (host, user, password, from, to)
+    send_email_report: true
+    smtp_host: "mail.example.com"            # relay hostname (required if send_email_report=true)
+    smtp_port: 25                             # default 25 (unauthenticated); set 587 for TLS auth
+    smtp_user: ""                             # leave blank for unauthenticated relay
+    smtp_password: ""                         # leave blank for unauthenticated relay
+    mail_from: "from@example.com"         # sender address (required if send_email_report=true)
+    mail_to: "to@example.com"          # recipient address (required if send_email_report=true)
+
+    # === Optional Git Publishing ===
+    # Enable git_publish_report to push report + optional snapshots to a Git repository.
+    # Requires AAP/Tower to provide gitlabpassword (via Survey or Extra Vars)
+    git_publish_report: true                  # set to true to clone/push to Git repo
+    git_reports_repo_path: "/reports"        # local clone destination on AAP executor
+    git_reports_repo_url: "https://example.com/reports.git"
+    git_reports_subdir: "vpc-upgrade-reports" # subdirectory within repo for reports
+    git_publish_snapshots: true               # push interface snapshots alongside report
+    git_snapshots_subdir: "vpc-interface-snapshots" # subdirectory within repo for snapshots
+    git_branch: "main"
+    git_user_name: "awx"
+    git_user_email: "awx@example.com"
+    gitlabuser: "{{ git_user_name }}"        # username for Git authentication
+    gitlabpassword: "{{ git_user_password }}" # password for Git authentication (from AAP survey/extra vars)
+
+  # ========================================================================
+  # PHASE 1: PER-HOST DISCOVERY
+  # ========================================================================
+  # Each device in the inventory runs 'show vpc role' to extract:
+  #   - vPC role (primary or secondary)
+  #   - Local system MAC address
+  #   - Peer system MAC address
+  # These MACs are normalized (lowercase, colon-removed) for reciprocal matching.
+  # ========================================================================
+  pre_tasks:
+    # --- CRITICAL: Freeze timestamps at start to prevent re-evaluation drift ---
+    # Timestamps are evaluated multiple times throughout the playbook. By freezing
+    # them here, we ensure Git commit messages, report headers, and email subjects
+    # all reference the same timestamp, preventing confusion about report timing.
+    - name: Init | Freeze report timestamp
+      set_fact:
+        report_timestamp: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+    - name: Init | Freeze report filename
+      set_fact:
+        report_file: "vpc_upgrade_report_{{ report_timestamp }}.txt"
+
+    # --- Run discovery command ---
+    # 'show vpc role' returns a block of text with three critical fields:
+    #   - vPC role: (primary or secondary)
+    #   - vPC local system-mac: XX:XX:XX:XX:XX:XX
+    #   - vPC peer system-mac: XX:XX:XX:XX:XX:XX
+    - name: Collect | show vpc role
+      cisco.nxos.nxos_command:
+        commands:
+          - "show vpc role"
+      register: precheck_out
+
+    - name: Stage | Raw role output (safe default, no direct indexing)
+      set_fact:
+        vpc_role_text: "{{ (precheck_out.stdout | default([]) | first) | default('') }}"
+
+    # --- PARSING STEP 1: Extract raw fields with regex ---
+    # Use case-insensitive regex ((?im) flags) to find the three fields.
+    # MAC regex [0-9A-Fa-f:]{17} matches exactly 17 chars (6 pairs + 5 colons).
+    # Note: We extract to raw variables FIRST, then normalize. This prevents
+    # fact evaluation order issues in Jinja2 template expressions.
+    - name: Parse | Extract role + raw MACs from 'show vpc role' (regex_findall with inline flags)
+      set_fact:
+        # Extract vPC role (expected: 'primary' or 'secondary')
+        vpc_role_raw: >-
+          {{
+            (vpc_role_text
+             | regex_findall('(?im)^\s*vPC\s*role\s*:\s*(\S+)'))
+            | first | default('unknown')
+          }}
+        # Extract local system MAC address (format: XX:XX:XX:XX:XX:XX)
+        vpc_local_mac_raw: >-
+          {{
+            (vpc_role_text
+             | regex_findall('(?im)^\s*vPC\s*local\s*system-mac\s*:\s*([0-9A-Fa-f:]{17})'))
+            | first | default('')
+          }}
+        # Extract peer system MAC address (format: XX:XX:XX:XX:XX:XX)
+        vpc_peer_mac_raw: >-
+          {{
+            (vpc_role_text
+             | regex_findall('(?im)^\s*vPC\s*peer\s*system-mac\s*:\s*([0-9A-Fa-f:]{17})'))
+            | first | default('')
+          }}
+
+    # --- PARSING STEP 2: Normalize for reciprocal matching ---
+    # Convert MACs to lowercase and remove colons (e.g., AA:BB:CC:DD:EE:FF -> aabbccddeeee)
+    # This normalized form is used to match Primary's peer MAC with Secondary's local MAC.
+    - name: Normalize | Final facts used for pairing
+      set_fact:
+        vpc_role: "{{ vpc_role_raw | lower | trim }}"
+        vpc_local_mac: "{{ vpc_local_mac_raw | lower | replace(':','') | trim }}"
+        vpc_peer_mac:  "{{ vpc_peer_mac_raw  | lower | replace(':','') | trim }}"
+
+    - name: Assert | Must parse local and peer MACs
+      assert:
+        that:
+          - vpc_local_mac | length > 0
+          - vpc_peer_mac | length > 0
+        fail_msg: >-
+          {{ inventory_hostname }}: Could not parse local/peer MACs from 'show vpc role'. Ensure the device is in a vPC domain.
+
+    - name: Snapshot | Save per-host discovery (for Tower visibility)
+      delegate_to: localhost
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/{{ inventory_hostname }}_vpc_discovery.txt"
+        content: |-
+          === {{ inventory_hostname }} vPC Discovery ===
+          Role: {{ vpc_role }}   (raw: {{ vpc_role_raw }})
+          Local MAC raw: {{ vpc_local_mac_raw }}
+          Peer  MAC raw: {{ vpc_peer_mac_raw }}
+          Local MAC norm: {{ vpc_local_mac }}
+          Peer  MAC norm: {{ vpc_peer_mac }}
+          ===============================================
+
+  # ========================================================================
+  # PHASE 2: PAIR COMPUTATION & VALIDATION
+  # ========================================================================
+  # This phase runs on the AAP/Tower controller (localhost) after all hosts
+  # have completed discovery. It uses the MACs extracted in Phase 1 to compute
+  # which devices form vPC pairs and assigns primary/secondary roles.
+  #
+  # PAIRING LOGIC:
+  #   A valid pair (A, B) satisfies: A.peer_mac == B.local_mac AND B.peer_mac == A.local_mac
+  #   This ensures each device knows about the other and they have matching roles.
+  #
+  # ROLE ASSIGNMENT:
+  #   The playbook identifies which member is 'primary' and which is 'secondary'.
+  #   This controls upgrade sequencing: primary always upgrades first.
+  # ========================================================================
+  tasks:
+    # --- Compute pairs using reciprocal MAC validation ---
+    # For each host A, search for host B where:
+    #   A.peer_mac == B.local_mac AND B.peer_mac == A.local_mac
+    # This bidirectional check ensures both devices know about each other.
+    # De-duplicate by pair key (alphabetically sorted local MACs joined with '_').
+    - name: Controller | Compute reciprocal vPC pairs from play hosts
+      run_once: true
+      delegate_to: localhost
+      vars:
+        hosts_in_play: "{{ play_hosts | default([]) }}"
+      set_fact:
+        vpc_pairs: >-
+          {%- set pairs = [] -%}
+          {%- for a in hosts_in_play -%}
+            {%- set a_local = hostvars[a].vpc_local_mac | default('') -%}
+            {%- set a_peer  = hostvars[a].vpc_peer_mac  | default('') -%}
+            {%- if a_local and a_peer -%}
+              {%- for b in hosts_in_play if b != a -%}
+                {%- set b_local = hostvars[b].vpc_local_mac | default('') -%}
+                {%- set b_peer  = hostvars[b].vpc_peer_mac  | default('') -%}
+                {%- if a_peer == b_local and b_peer == a_local -%}
+                  {%- set key = [a_local, b_local] | sort | join('_') -%}
+                  {%- if not (pairs | selectattr('key','equalto',key) | list) -%}
+                    {%- set _ = pairs.append({'key': key, 'members': [a, b] | sort }) -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ pairs }}
+
+    - name: Debug | Discovered pairs
+      run_once: true
+      delegate_to: localhost
+      debug:
+        var: vpc_pairs
+
+    # --- Annotate pairs with primary/secondary role information ---
+    # For each pair member, extract its role from the host vars.
+    # Identify which member is primary and which is secondary.
+    # This info drives upgrade ordering and reporting.
+    - name: Compute | vPC pairs with roles (annotated)
+      run_once: true
+      delegate_to: localhost
+      set_fact:
+        vpc_pairs_with_roles: >-
+          {%- set out = [] -%}
+          {%- for p in vpc_pairs | default([]) -%}
+            {%- set members = p.members | default([]) -%}
+            {%- if members | length == 2 -%}
+              {%- set h0 = members[0] -%}
+              {%- set h1 = members[1] -%}
+              {%- set r0 = (hostvars[h0].vpc_role | default('unknown')) | lower -%}
+              {%- set r1 = (hostvars[h1].vpc_role | default('unknown')) | lower -%}
+              {%- set role_map = {
+                    h0: r0,
+                    h1: r1
+                  } -%}
+              {%- set primary = h0 if r0 == 'primary' else (h1 if r1 == 'primary' else '') -%}
+              {%- set secondary = h0 if r0 == 'secondary' else (h1 if r1 == 'secondary' else '') -%}
+              {%- set _ = out.append({
+                    'key': p.key,
+                    'members': members,
+                    'roles': role_map,
+                    'primary': primary,
+                    'secondary': secondary
+                  }) -%}
+            {%- else -%}
+              {%- set _ = out.append({
+                    'key': p.key,
+                    'members': members,
+                    'roles': {},
+                    'primary': '',
+                    'secondary': ''
+                  }) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    # --- Validation block: ensure all pairs are valid ---
+    # A valid pair must have:
+    #   1. Exactly 2 members
+    #   2. One primary and one secondary role (not both primary, not both secondary)
+    # Also check that no devices are left unpaired.
+    # If validation fails, halt with descriptive error message.
+    - name: Validate | each pair has 2 members and roles (primary+secondary)
+      run_once: true
+      delegate_to: localhost
+      block:
+        - name: Build invalid list
+          set_fact:
+            invalid_pairs: >-
+              {%- set bad = [] -%}
+              {%- for p in vpc_pairs | default([]) -%}
+                {%- set m = p.members | default([]) -%}
+                {%- if m | length != 2 -%}
+                  {%- set _ = bad.append({'key': p.key, 'members': m, 'why': 'not_two_members'}) -%}
+                {%- else -%}
+                  {%- set r0 = hostvars[m[0]].vpc_role | default('unknown') | lower -%}
+                  {%- set r1 = hostvars[m[1]].vpc_role | default('unknown') | lower -%}
+                  {%- if not (('primary' in [r0, r1]) and ('secondary' in [r0, r1])) -%}
+                    {%- set _ = bad.append({'key': p.key, 'members': m, 'roles': [r0, r1], 'why': 'role_mismatch'}) -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {{ bad }}
+        - name: Build paired host list
+          set_fact:
+            paired_hosts: "{{ (vpc_pairs | default([]) | map(attribute='members') | flatten | unique | list) }}"
+
+        - name: Build unpaired host list
+          set_fact:
+            unpaired_hosts: "{{ (play_hosts | default([])) | difference(paired_hosts | default([])) }}"
+        - name: Assert | no invalid pairs
+          assert:
+            that:
+              - invalid_pairs | length == 0
+              - unpaired_hosts | length == 0
+            fail_msg: >-
+              Pair validation failed.
+              Unpaired hosts: {{ unpaired_hosts | default([]) | join(', ') if (unpaired_hosts | default([]) | length > 0) else 'none' }}
+              Invalid vPC pairs discovered:
+              {% for p in invalid_pairs %}
+              * key={{ p.key }} members={{ p.members | default([]) }} roles={{ p.roles | default('n/a') }} why={{ p.why }}
+              {% endfor %}
+
+    # Make pairs visible to Tower notifications
+    - name: Publish | pairs to job artifacts
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.set_stats:
+        data:
+          vpc_pairs_pretty: "{{ vpc_pairs_with_roles | to_nice_json }}"
+
+  # ========================================================================
+  # PHASE 2B: PRE-UPGRADE CONFIG BACKUP
+  # ========================================================================
+  # Save the running config to startup config on each device.
+  # This is a safety measure in case the device needs to be recovered
+  # or rolled back after the upgrade.
+  # ========================================================================
+    - name: Backup | Save running-config to startup-config on all hosts
+      cisco.nxos.nxos_command:
+        commands:
+          - "copy running-config startup-config"
+      register: config_save_out
+
+    - name: Confirm | Configs saved before upgrade
+      run_once: true
+      delegate_to: localhost
+      debug:
+        msg: "Configs backed up on all devices before upgrade cycle begins"
+
+  # ========================================================================
+  # PHASE 3: PAIR UPGRADE EXECUTION
+  # ========================================================================
+  # Iterate through each discovered pair and execute the per-pair upgrade workflow.
+  # The Upgrade_Workflow.yml playbook handles:
+  #   1. Primary device upgrade (standard + optional EPLD)
+  #   2. Wait for primary to recover + health checks
+  #   3. Secondary device upgrade (standard + optional EPLD)
+  #   4. Wait for secondary to recover + health checks
+  #   5. Interface snapshot capture (pre/post comparison)
+  #   6. Pair statistics collection for reporting
+  #
+  # Pairs are processed sequentially (not in parallel) to avoid overwhelming
+  # the network and to allow meaningful error detection/halting.
+  # ========================================================================
+    - name: Process each pair sequentially
+      run_once: true
+      include_tasks: Upgrade_Workflow.yml
+      loop: "{{ vpc_pairs_with_roles }}"
+      loop_control:
+        loop_var: pair
+
+  # ========================================================================
+  # PHASE 4: FINAL REPORTING
+  # ========================================================================
+  # Generate comprehensive report summarizing:
+  #   - Overall upgrade status (NO_PAIRS_FOUND, SUCCESS, FAILED_OR_PARTIAL)
+  #   - Per-pair upgrade results with interface snapshots (pre/post)
+  #   - Connection status changes
+  #   - Cumulative timing and statistics
+  #
+  # Report can be output in multiple formats (table or JSON).
+  # Optionally publish to Git and/or email.
+  # ========================================================================
+  post_tasks:
+    - name: Report | Build final text report with roles
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/{{ report_file }}"
+        content: |-
+          ====== Nexus vPC Upgrade Report ======
+          Timestamp: {{ report_timestamp }}
+          {% set total_pairs = (vpc_pairs_with_roles | default([]) | length) %}
+          {% set done_pairs = (processed_pairs | default([]) | length) %}
+          {% if total_pairs == 0 %}
+          Overall status: NO_PAIRS_FOUND
+          {% elif done_pairs == total_pairs %}
+          Overall status: SUCCESS
+          {% else %}
+          Overall status: FAILED_OR_PARTIAL
+          {% endif %}
+          Pairs completed: {{ done_pairs }}/{{ total_pairs }}
+
+          Pairs discovered (with roles):
+          {% for p in vpc_pairs_with_roles | default([]) %}
+          - key={{ p.key }}
+            members: {{ p.members | join(', ') }}
+            roles:
+              {% for h,r in p.roles.items() %}
+              * {{ h }} → {{ r }}
+              {% endfor %}
+            primary:  {{ p.primary | default('n/a') }}
+            secondary: {{ p.secondary | default('n/a') }}
+          {% endfor %}
+
+          Processed pairs (in order):
+          {% if processed_pairs is defined and processed_pairs|length > 0 %}
+            {{ processed_pairs | join(', ') }}
+          {% else %}
+            none
+          {% endif %}
+
+          Per-host interface snapshots saved (JSON files):
+          {% if save_snapshot_files | bool %}
+          {% for p in vpc_pairs_with_roles | default([]) %}
+            - {{ report_dir }}/{{ p.primary }}_pre_interfaces.json
+            - {{ report_dir }}/{{ p.primary }}_post_interfaces.json
+            - {{ report_dir }}/{{ p.secondary }}_pre_interfaces.json
+            - {{ report_dir }}/{{ p.secondary }}_post_interfaces.json
+          {% endfor %}
+          {% else %}
+            disabled (embedded inline below)
+          {% endif %}
+
+          Per-pair interface snapshots (connected-only, tabular):
+          {% for p in vpc_pairs_with_roles | default([]) %}
+          === Pair {{ p.key }} ===
+          Primary: {{ p.primary }}
+          {% set p_pre = ((hostvars[p.primary].pre_interfaces_map | default({})) | dict2items | selectattr('value.status','equalto','connected') | sort(attribute='key')) %}
+          {% set p_post = ((hostvars[p.primary].post_interfaces_map | default({})) | dict2items | selectattr('value.status','equalto','connected') | sort(attribute='key')) %}
+
+          --- {{ p.primary }} PRE ---
+          {{ "%-10s %-10s %-8s %-7s %s" | format("PORT","VLAN","SPEED","DUPLEX","TYPE") }}
+          {{ "%-10s %-10s %-8s %-7s %s" | format("----------","----------","--------","-------","--------------------") }}
+          {% if p_pre | length == 0 %}
+          (none)
+          {% else %}
+          {% for i in p_pre %}
+          {{ "%-10s %-10s %-8s %-7s %s" | format(i.value.port | default(i.key), i.value.vlan | default(""), i.value.speed | default(""), i.value.duplex | default(""), i.value.type | default("")) }}
+          {% endfor %}
+          {% endif %}
+
+          --- {{ p.primary }} POST ---
+          {{ "%-10s %-10s %-8s %-7s %s" | format("PORT","VLAN","SPEED","DUPLEX","TYPE") }}
+          {{ "%-10s %-10s %-8s %-7s %s" | format("----------","----------","--------","-------","--------------------") }}
+          {% if p_post | length == 0 %}
+          (none)
+          {% else %}
+          {% for i in p_post %}
+          {{ "%-10s %-10s %-8s %-7s %s" | format(i.value.port | default(i.key), i.value.vlan | default(""), i.value.speed | default(""), i.value.duplex | default(""), i.value.type | default("")) }}
+          {% endfor %}
+          {% endif %}
+
+          Secondary: {{ p.secondary }}
+          {% set s_pre = ((hostvars[p.secondary].pre_interfaces_map | default({})) | dict2items | selectattr('value.status','equalto','connected') | sort(attribute='key')) %}
+          {% set s_post = ((hostvars[p.secondary].post_interfaces_map | default({})) | dict2items | selectattr('value.status','equalto','connected') | sort(attribute='key')) %}
+
+          --- {{ p.secondary }} PRE ---
+          {{ "%-10s %-10s %-8s %-7s %s" | format("PORT","VLAN","SPEED","DUPLEX","TYPE") }}
+          {{ "%-10s %-10s %-8s %-7s %s" | format("----------","----------","--------","-------","--------------------") }}
+          {% if s_pre | length == 0 %}
+          (none)
+          {% else %}
+          {% for i in s_pre %}
+          {{ "%-10s %-10s %-8s %-7s %s" | format(i.value.port | default(i.key), i.value.vlan | default(""), i.value.speed | default(""), i.value.duplex | default(""), i.value.type | default("")) }}
+          {% endfor %}
+          {% endif %}
+
+          --- {{ p.secondary }} POST ---
+          {{ "%-10s %-10s %-8s %-7s %s" | format("PORT","VLAN","SPEED","DUPLEX","TYPE") }}
+          {{ "%-10s %-10s %-8s %-7s %s" | format("----------","----------","--------","-------","--------------------") }}
+          {% if s_post | length == 0 %}
+          (none)
+          {% else %}
+          {% for i in s_post %}
+          {{ "%-10s %-10s %-8s %-7s %s" | format(i.value.port | default(i.key), i.value.vlan | default(""), i.value.speed | default(""), i.value.duplex | default(""), i.value.type | default("")) }}
+          {% endfor %}
+          {% endif %}
+          {% endfor %}
+          ======================================
+
+    # --- Email Delivery (optional) ---
+    # If send_email_report is enabled, validate SMTP settings and send report via email.
+    # SMTP user/password are optional (for unauthenticated relay on port 25).
+    - name: Email report | Validate SMTP and recipient settings
+      when: send_email_report | bool
+      run_once: true
+      delegate_to: localhost
+      assert:
+        that:
+          - smtp_host | string | length > 0
+          - mail_from | string | length > 0
+          - mail_to | string | length > 0
+        fail_msg: >
+          send_email_report=true requires smtp_host, mail_from, and mail_to.
+          SMTP user and password are optional (for unauthenticated relay on port 25).
+
+    - name: Email report | Read final report content
+      when: send_email_report | bool
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.slurp:
+        src: "{{ report_src_path | default(report_dir ~ '/' ~ report_file) }}"
+      register: report_email_blob
+
+    - name: Email report | Send via SMTP
+      when: send_email_report | bool
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port | default(25) }}"
+        username: "{{ smtp_user | default(omit) }}"
+        password: "{{ smtp_password | default(omit) }}"
+        secure: "{{ 'starttls' if smtp_user else 'never' }}"
+        from: "{{ mail_from }}"
+        to: "{{ mail_to }}"
+        subject: "Nexus vPC Upgrade Report {{ report_timestamp }}"
+        body: "{{ report_email_blob.content | b64decode }}"
+
+    - name: Report | Show path
+      run_once: true
+      delegate_to: localhost
+      debug:
+        msg: "Report generated: {{ report_dir }}/{{ report_file }}"
+
+    # --- Git Publishing (optional) ---
+    # If git_publish_report is enabled, clone the target repo, copy the report
+    # (and optional snapshot files), commit, and push. Credentials come from AAP
+    # via gitlabuser/gitlabpassword (URL-encoded in the clone URL).
+    - name: Git report | Check expected report path
+      when: git_publish_report | bool
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.stat:
+        path: "{{ report_dir }}/{{ report_file }}"
+      register: expected_report_stat
+
+    - name: Git report | Find latest generated report (fallback)
+      when:
+        - git_publish_report | bool
+        - not expected_report_stat.stat.exists
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.find:
+        paths: "{{ report_dir }}"
+        patterns: "vpc_upgrade_report_*.txt"
+        file_type: file
+      register: report_candidates
+
+    - name: Git report | Resolve source report path
+      when: git_publish_report | bool
+      run_once: true
+      delegate_to: localhost
+      set_fact:
+        report_src_path: >-
+          {{
+            (report_dir ~ '/' ~ report_file)
+            if (expected_report_stat.stat.exists | default(false))
+            else
+            (
+              (report_candidates.files | sort(attribute='mtime') | map(attribute='path') | list | last)
+              | default('')
+            )
+          }}
+
+    - name: Git report | Validate resolved source path exists
+      when: git_publish_report | bool
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.stat:
+        path: "{{ report_src_path }}"
+      register: resolved_report_stat
+
+    - name: Git report | Assert source report exists
+      when: git_publish_report | bool
+      run_once: true
+      delegate_to: localhost
+      assert:
+        that:
+          - report_src_path | length > 0
+          - resolved_report_stat.stat.exists
+        fail_msg: >-
+          Could not find final report to publish.
+          Expected: {{ report_dir }}/{{ report_file }}
+          Fallback pattern: {{ report_dir }}/vpc_upgrade_report_*.txt
+
+    - name: Git report | Ensure credentials are provided
+      when: git_publish_report | bool
+      run_once: true
+      delegate_to: localhost
+      assert:
+        that:
+          - gitlabuser is defined
+          - gitlabpassword is defined
+          - (gitlabuser | string | length) > 0
+          - (gitlabpassword | string | length) > 0
+        fail_msg: >-
+          git_publish_report=true requires gitlabuser and gitlabpassword variables
+          (for example from AAP credential prompt/survey).
+
+    - name: Git report | Ensure repo parent directory exists
+      when: git_publish_report | bool
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.file:
+        path: "{{ git_reports_repo_path }}"
+        state: directory
+        mode: "0775"
+
+    - name: Git report | Clone or update reports repo with AAP credentials
+      when: git_publish_report | bool
+      run_once: true
+      delegate_to: localhost
+      no_log: true
+      ansible.builtin.git:
+        repo: "{{ git_reports_repo_url | regex_replace('^https://', 'https://' ~ (gitlabuser | urlencode) ~ ':' ~ (gitlabpassword | urlencode) ~ '@') }}"
+        dest: "{{ git_reports_repo_path }}"
+        version: "{{ git_branch }}"
+        clone: true
+        update: true
+        accept_hostkey: true
+
+    - name: Git report | Ensure report subdirectory exists in repo
+      when: git_publish_report | bool
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.file:
+        path: "{{ git_reports_repo_path }}/{{ git_reports_subdir }}"
+        state: directory
+        mode: "0775"
+
+    - name: Git report | Find interface snapshot JSON files
+      when:
+        - git_publish_report | bool
+        - git_publish_snapshots | bool
+        - save_snapshot_files | bool
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.find:
+        paths: "{{ report_dir }}"
+        patterns:
+          - "*_pre_interfaces.json"
+          - "*_post_interfaces.json"
+        file_type: file
+      register: snapshot_files
+
+    - name: Git report | Ensure snapshots subdirectory exists in repo
+      when:
+        - git_publish_report | bool
+        - git_publish_snapshots | bool
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.file:
+        path: "{{ git_reports_repo_path }}/{{ git_snapshots_subdir }}"
+        state: directory
+        mode: "0775"
+
+    - name: Git report | Copy final report into repo
+      when: git_publish_report | bool
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.copy:
+        src: "{{ report_src_path }}"
+        dest: "{{ git_reports_repo_path }}/{{ git_reports_subdir }}/{{ report_src_path | basename }}"
+        remote_src: true
+
+    - name: Git report | Copy interface snapshots into repo
+      when:
+        - git_publish_report | bool
+        - git_publish_snapshots | bool
+        - (snapshot_files.matched | default(0)) | int > 0
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.copy:
+        src: "{{ item.path }}"
+        dest: "{{ git_reports_repo_path }}/{{ git_snapshots_subdir }}/{{ item.path | basename }}"
+        remote_src: true
+      loop: "{{ snapshot_files.files | default([]) }}"
+
+    - name: Git report | Configure git user.name
+      when: git_publish_report | bool
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.command:
+        cmd: git config user.name "{{ git_user_name }}"
+        chdir: "{{ git_reports_repo_path }}"
+
+    - name: Git report | Configure git user.email
+      when: git_publish_report | bool
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.command:
+        cmd: git config user.email "{{ git_user_email }}"
+        chdir: "{{ git_reports_repo_path }}"
+
+    - name: Git report | Add report file
+      when: git_publish_report | bool
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.command:
+        cmd: git add "{{ git_reports_subdir }}/{{ report_src_path | basename }}"
+        chdir: "{{ git_reports_repo_path }}"
+
+    - name: Git report | Add snapshot files
+      when:
+        - git_publish_report | bool
+        - git_publish_snapshots | bool
+        - (snapshot_files.matched | default(0)) | int > 0
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.command:
+        cmd: git add "{{ git_snapshots_subdir }}/"
+        chdir: "{{ git_reports_repo_path }}"
+
+    - name: Git report | Commit if there are changes
+      when: git_publish_report | bool
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.command:
+        cmd: git commit -m "Nexus vPC upgrade report {{ report_timestamp }}"
+        chdir: "{{ git_reports_repo_path }}"
+      register: git_commit_result
+      failed_when: git_commit_result.rc not in [0, 1]
+      changed_when: git_commit_result.rc == 0
+
+    - name: Git report | Push to remote branch
+      when:
+        - git_publish_report | bool
+        - git_commit_result.rc == 0
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.command:
+        cmd: git push origin "{{ git_branch }}"
+        chdir: "{{ git_reports_repo_path }}"
