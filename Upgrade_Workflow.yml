@@ -1,0 +1,625 @@
+
+# Expects: "pair" from include_tasks loop (each item contains key, members, primary, secondary, roles)
+# Uses play vars: update_epld, nxos_image, epld_image, issu, wait_timeout_sec, settle_seconds, halt_on_failure, report_dir
+
+- name: Derive | hosts for this pair
+  set_fact:
+    h0: "{{ pair.members[0] }}"
+    h1: "{{ pair.members[1] }}"
+    secondary_host: "{{ pair.secondary }}"
+    primary_host:   "{{ pair.primary }}"
+
+- name: Assert | roles present for {{ pair.key }}
+  assert:
+    that:
+      - secondary_host | length > 0
+      - primary_host   | length > 0
+    fail_msg: >-
+      Pair {{ pair.key }} missing roles. roles={{ pair.roles | default({}) }}
+
+################################################################################
+# PRE: capture + parse full interface status for h0 and h1 (normalize Status/Vlan)
+################################################################################
+
+- name: PRE | Capture 'show interface status' (h0)
+  delegate_to: "{{ h0 }}"
+  cisco.nxos.nxos_command:
+    commands: ["show interface status"]
+  register: pre_ifstatus_h0
+
+- name: PRE | Parse into dict (h0) — normalize Status/Vlan, ignore Desc
+  delegate_to: "{{ h0 }}"
+  delegate_facts: true
+  vars:
+    pre_if_raw_h0: >-
+      {{
+        pre_ifstatus_h0.stdout[0]
+        | regex_replace('(?m)^-+.*\n', '')                               
+        | regex_replace('(?m)^\s*Port\s+Name\s+Status.*\n', '')        
+        | regex_replace('\r', '')                                        
+        | regex_replace('\n\s{2,}', ' ')                                 
+      }}
+    pre_lines_h0: "{{ pre_if_raw_h0.split('\n') }}"
+    status_vocab: [ 'connected','notconnect','disabled','errdisabled','inactive',
+                    'monitoring','link-flap','xcvrabsent','sfpabsent' ]
+  set_fact:
+    pre_interfaces_map: >-
+      {%- set m = {} -%}
+      {%- for ln in pre_lines_h0 -%}
+        {%- if ln | regex_search('^(Eth|mgmt|Po|Gi|Te|Hu|Lo)') -%}
+          {%- set toks = ln | regex_findall('\S+') -%}
+          {%- if (toks|length) >= 4 -%}
+            {%- set port = toks[0] -%}
+            
+            {%- set cand = [] -%}
+            {%- for i in range(1, toks|length) -%}
+              {%- set tk = (toks[i] | lower) -%}
+              {%- if (tk in status_vocab) or (tk | regex_search('^xcvr|^sfp')) -%}
+                {%- set _ = cand.append(i) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set st_idx = (cand[0] if (cand|length) > 0 else -1) -%}
+
+            {%- if st_idx != -1 -%}
+              {%- set status_raw = toks[st_idx] | lower -%}
+              {%- set vlan_raw   = (toks[st_idx+1] | default('')) | lower -%}
+              {%- set duplex     = (toks[st_idx+2] | default('')) | lower -%}
+              {%- set speed      = (toks[st_idx+3] | default('')) | lower -%}
+              {%- set type_val   = (toks[st_idx+4:] | join(' ') ) -%}
+              
+              {%- set status_norm = (
+                    (status_raw ~ ' ' ~ vlan_raw)
+                    | regex_findall('(?i)^(connected)\s+(routed|trunk|\d+)$')
+                    | first
+                    | default([])
+                ) -%}
+              {%- if status_norm and (status_norm|length) == 2 -%}
+                {%- set status = status_norm[0] | lower -%}
+                {%- set vlan   = status_norm[1] | lower -%}
+              {%- else -%}
+                {%- set status = status_raw -%}
+                {%- set vlan   = vlan_raw -%}
+              {%- endif -%}
+             
+              {%- if status | regex_search('(?i)^xcvr') -%}{%- set status = 'xcvrabsent' -%}{%- endif -%}
+              {%- if status | regex_search('(?i)^sfp')  -%}{%- set status = 'sfpabsent'  -%}{%- endif -%}
+
+              {%- set _ = m.update({
+                    port: {
+                      'port': port, 'status': status,
+                      'vlan': vlan, 'duplex': duplex, 'speed': speed, 'type': type_val
+                    }
+                  }) -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ m }}
+
+- name: PRE | Save snapshot (h0)
+  when: save_snapshot_files | default(false) | bool
+  delegate_to: localhost
+  ansible.builtin.copy:
+    dest: "{{ report_dir }}/{{ h0 }}_pre_interfaces.json"
+    content: "{{ hostvars[h0].pre_interfaces_map | to_nice_json }}"
+
+- name: PRE | Capture 'show interface status' (h1)
+  delegate_to: "{{ h1 }}"
+  cisco.nxos.nxos_command:
+    commands: ["show interface status"]
+  register: pre_ifstatus_h1
+
+- name: PRE | Parse into dict (h1) — normalize Status/Vlan, ignore Desc
+  delegate_to: "{{ h1 }}"
+  delegate_facts: true
+  vars:
+    pre_if_raw_h1: >-
+      {{
+        pre_ifstatus_h1.stdout[0]
+        | regex_replace('(?m)^-+.*\n', '')
+        | regex_replace('(?m)^\s*Port\s+Name\s+Status.*\n', '')
+        | regex_replace('\r', '')
+        | regex_replace('\n\s{2,}', ' ')
+      }}
+    pre_lines_h1: "{{ pre_if_raw_h1.split('\n') }}"
+    status_vocab: [ 'connected','notconnect','disabled','errdisabled','inactive',
+                    'monitoring','link-flap','xcvrabsent','sfpabsent' ]
+  set_fact:
+    pre_interfaces_map: >-
+      {%- set m = {} -%}
+      {%- for ln in pre_lines_h1 -%}
+        {%- if ln | regex_search('^(Eth|mgmt|Po|Gi|Te|Hu|Lo)') -%}
+          {%- set toks = ln | regex_findall('\S+') -%}
+          {%- if (toks|length) >= 4 -%}
+            {%- set port = toks[0] -%}
+
+            {%- set cand = [] -%}
+            {%- for i in range(1, toks|length) -%}
+              {%- set tk = (toks[i] | lower) -%}
+              {%- if (tk in status_vocab) or (tk | regex_search('^xcvr|^sfp')) -%}
+                {%- set _ = cand.append(i) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set st_idx = (cand[0] if (cand|length) > 0 else -1) -%}
+
+            {%- if st_idx != -1 -%}
+              {%- set status_raw = toks[st_idx] | lower -%}
+              {%- set vlan_raw   = (toks[st_idx+1] | default('')) | lower -%}
+              {%- set duplex     = (toks[st_idx+2] | default('')) | lower -%}
+              {%- set speed      = (toks[st_idx+3] | default('')) | lower -%}
+              {%- set type_val   = (toks[st_idx+4:] | join(' ') ) -%}
+
+              {%- set status_norm = (
+                    (status_raw ~ ' ' ~ vlan_raw)
+                    | regex_findall('(?i)^(connected)\s+(routed|trunk|\d+)$')
+                    | first
+                    | default([])
+                ) -%}
+              {%- if status_norm and (status_norm|length) == 2 -%}
+                {%- set status = status_norm[0] | lower -%}
+                {%- set vlan   = status_norm[1] | lower -%}
+              {%- else -%}
+                {%- set status = status_raw -%}
+                {%- set vlan   = vlan_raw -%}
+              {%- endif -%}
+
+              {%- if status | regex_search('(?i)^xcvr') -%}{%- set status = 'xcvrabsent' -%}{%- endif -%}
+              {%- if status | regex_search('(?i)^sfp')  -%}{%- set status = 'sfpabsent'  -%}{%- endif -%}
+
+              {%- set _ = m.update({
+                    port: {
+                      'port': port, 'status': status,
+                      'vlan': vlan, 'duplex': duplex, 'speed': speed, 'type': type_val
+                    }
+                  }) -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ m }}
+
+- name: PRE | Save snapshot (h1)
+  when: save_snapshot_files | default(false) | bool
+  delegate_to: localhost
+  ansible.builtin.copy:
+    dest: "{{ report_dir }}/{{ h1 }}_pre_interfaces.json"
+    content: "{{ hostvars[h1].pre_interfaces_map | to_nice_json }}"
+
+
+#################################
+# Upgrade primary → then secondary
+#################################
+
+- name: Upgrade | primary first (EPLD)
+  when: update_epld
+  delegate_to: "{{ primary_host }}"
+  cisco.nxos.nxos_command:
+    commands:
+      - "install all nxos {{ nxos_image }} epld {{ epld_image }}"
+
+- name: Upgrade | primary first (standard)
+  when: not update_epld
+  delegate_to: "{{ primary_host }}"
+  cisco.nxos.nxos_install_os:
+    system_image_file: "{{ nxos_image }}"
+    issu: "{{ issu }}"
+
+- name: Wait for SSH (primary) to return
+  delegate_to: localhost
+  vars:
+    target_ip: "{{ hostvars[primary_host].ansible_host | default(primary_host) }}"
+  ansible.builtin.wait_for:
+    host: "{{ target_ip }}"
+    port: 22
+    timeout: "{{ wait_timeout_sec }}"
+    state: started
+
+- name: Settle | pause after primary
+  ansible.builtin.pause:
+    seconds: "{{ settle_seconds }}"
+
+- name: Health wait | primary vPC convergence
+  delegate_to: "{{ primary_host }}"
+  cisco.nxos.nxos_command:
+    commands: ["show vpc"]
+  register: post_primary_vpc
+  failed_when: false
+  retries: 30
+  delay: 20
+  until:
+    - (post_primary_vpc.stdout | default([]) | length) > 0
+    - (post_primary_vpc.stdout[0] | default('') | regex_search('(?im)^\s*vPC\s+status\s*:\s*up\s*$')) is not none
+    - (post_primary_vpc.stdout[0] | default('') | regex_search('(?im)^\s*Peer\s+status\s*:\s*peer adjacency formed(\s+ok)?\s*$')) is not none
+
+- name: Assert health | primary vPC is up and peer adjacency formed
+  assert:
+    that:
+      - (post_primary_vpc.stdout | default([]) | length) > 0
+      - (post_primary_vpc.stdout[0] | default('') | regex_search('(?im)^\s*vPC\s+status\s*:\s*up\s*$')) is not none
+      - (post_primary_vpc.stdout[0] | default('') | regex_search('(?im)^\s*Peer\s+status\s*:\s*peer adjacency formed(\s+ok)?\s*$')) is not none
+    fail_msg: >-
+      Primary {{ primary_host }} health check failed after convergence wait.
+      Output:
+      {{ post_primary_vpc.stdout[0] | default('show vpc returned no output') }}
+
+- name: Upgrade | secondary (EPLD)
+  when: update_epld
+  delegate_to: "{{ secondary_host }}"
+  cisco.nxos.nxos_command:
+    commands:
+      - "install all nxos {{ nxos_image }} epld {{ epld_image }}"
+
+- name: Upgrade | secondary (standard)
+  when: not update_epld
+  delegate_to: "{{ secondary_host }}"
+  cisco.nxos.nxos_install_os:
+    system_image_file: "{{ nxos_image }}"
+    issu: "{{ issu }}"
+
+- name: Wait for SSH (secondary) to return
+  delegate_to: localhost
+  vars:
+    target_ip: "{{ hostvars[secondary_host].ansible_host | default(secondary_host) }}"
+  ansible.builtin.wait_for:
+    host: "{{ target_ip }}"
+    port: 22
+    timeout: "{{ wait_timeout_sec }}"
+    state: started
+
+- name: Settle | pause after secondary
+  ansible.builtin.pause:
+    seconds: "{{ settle_seconds }}"
+
+- name: Health wait | secondary vPC convergence
+  delegate_to: "{{ secondary_host }}"
+  cisco.nxos.nxos_command:
+    commands: ["show vpc"]
+  register: post_secondary_vpc
+  failed_when: false
+  retries: 30
+  delay: 20
+  until:
+    - (post_secondary_vpc.stdout | default([]) | length) > 0
+    - (post_secondary_vpc.stdout[0] | default('') | regex_search('(?im)^\s*vPC\s+status\s*:\s*up\s*$')) is not none
+    - (post_secondary_vpc.stdout[0] | default('') | regex_search('(?im)^\s*Peer\s+status\s*:\s*peer adjacency formed(\s+ok)?\s*$')) is not none
+
+- name: Assert health | secondary vPC is up and peer adjacency formed
+  assert:
+    that:
+      - (post_secondary_vpc.stdout | default([]) | length) > 0
+      - (post_secondary_vpc.stdout[0] | default('') | regex_search('(?im)^\s*vPC\s+status\s*:\s*up\s*$')) is not none
+      - (post_secondary_vpc.stdout[0] | default('') | regex_search('(?im)^\s*Peer\s+status\s*:\s*peer adjacency formed(\s+ok)?\s*$')) is not none
+    fail_msg: >-
+      Secondary {{ secondary_host }} health check failed after convergence wait.
+      Output:
+      {{ post_secondary_vpc.stdout[0] | default('show vpc returned no output') }}
+
+################################################################################
+# POST: capture + parse + compute diffs for h0 and h1 (connected-only)
+################################################################################
+
+- name: POST | Capture 'show interface status' (h0)
+  delegate_to: "{{ h0 }}"
+  cisco.nxos.nxos_command:
+    commands: ["show interface status"]
+  register: post_ifstatus_h0
+
+- name: POST | Parse into dict (h0) — normalize Status/Vlan, ignore Desc
+  delegate_to: "{{ h0 }}"
+  delegate_facts: true
+  vars:
+    post_if_raw_h0: >-
+      {{
+        post_ifstatus_h0.stdout[0]
+        | regex_replace('(?m)^-+.*\n', '')
+        | regex_replace('(?m)^\s*Port\s+Name\s+Status.*\n', '')
+        | regex_replace('\\r', '')
+        | regex_replace('\\n\\s{2,}', ' ')
+      }}
+    post_lines_h0: "{{ post_if_raw_h0.split('\n') }}"
+    status_vocab: [ 'connected','notconnect','disabled','errdisabled','inactive',
+                    'monitoring','link-flap','xcvrabsent','sfpabsent' ]
+  set_fact:
+    post_interfaces_map: >-
+      {%- set m = {} -%}
+      {%- for ln in post_lines_h0 -%}
+        {%- if ln | regex_search('^(Eth|mgmt|Po|Gi|Te|Hu|Lo)') -%}
+          {%- set toks = ln | regex_findall('\S+') -%}
+          {%- if (toks|length) >= 4 -%}
+            {%- set port = toks[0] -%}
+
+            {%- set cand = [] -%}
+            {%- for i in range(1, toks|length) -%}
+              {%- set tk = (toks[i] | lower) -%}
+              {%- if (tk in status_vocab) or (tk | regex_search('^xcvr|^sfp')) -%}
+                {%- set _ = cand.append(i) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set st_idx = (cand[0] if (cand|length) > 0 else -1) -%}
+
+            {%- if st_idx != -1 -%}
+              {%- set status_raw = toks[st_idx] | lower -%}
+              {%- set vlan_raw   = (toks[st_idx+1] | default('')) | lower -%}
+              {%- set duplex     = (toks[st_idx+2] | default('')) | lower -%}
+              {%- set speed      = (toks[st_idx+3] | default('')) | lower -%}
+              {%- set type_val   = (toks[st_idx+4:] | join(' ') ) -%}
+
+              {%- set status_norm = (
+                    (status_raw ~ ' ' ~ vlan_raw)
+                    | regex_findall('(?i)^(connected)\\s+(routed|trunk|\\d+)$')
+                    | first
+                    | default([])
+                ) -%}
+              {%- if status_norm and (status_norm|length) == 2 -%}
+                {%- set status = status_norm[0] | lower -%}
+                {%- set vlan   = status_norm[1] | lower -%}
+              {%- else -%}
+                {%- set status = status_raw -%}
+                {%- set vlan   = vlan_raw -%}
+              {%- endif -%}
+
+              {%- if status | regex_search('(?i)^xcvr') -%}{%- set status = 'xcvrabsent' -%}{%- endif -%}
+              {%- if status | regex_search('(?i)^sfp')  -%}{%- set status = 'sfpabsent'  -%}{%- endif -%}
+
+              {%- set _ = m.update({
+                    port: {
+                      'port': port, 'status': status,
+                      'vlan': vlan, 'duplex': duplex, 'speed': speed, 'type': type_val
+                    }
+                  }) -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ m }}
+
+- name: POST | Save snapshot (h0)
+  when: save_snapshot_files | default(false) | bool
+  delegate_to: localhost
+  ansible.builtin.copy:
+    dest: "{{ report_dir }}/{{ h0 }}_post_interfaces.json"
+    content: "{{ hostvars[h0].post_interfaces_map | to_nice_json }}"
+
+- name: POST | Capture 'show interface status' (h1)
+  delegate_to: "{{ h1 }}"
+  cisco.nxos.nxos_command:
+    commands: ["show interface status"]
+  register: post_ifstatus_h1
+
+- name: POST | Parse into dict (h1) — normalize Status/Vlan, ignore Desc
+  delegate_to: "{{ h1 }}"
+  delegate_facts: true
+  vars:
+    post_if_raw_h1: >-
+      {{
+        post_ifstatus_h1.stdout[0]
+        | regex_replace('(?m)^-+.*\n', '')
+        | regex_replace('(?m)^\s*Port\s+Name\s+Status.*\n', '')
+        | regex_replace('\\r', '')
+        | regex_replace('\\n\\s{2,}', ' ')
+      }}
+    post_lines_h1: "{{ post_if_raw_h1.split('\n') }}"
+    status_vocab: [ 'connected','notconnect','disabled','errdisabled','inactive',
+                    'monitoring','link-flap','xcvrabsent','sfpabsent' ]
+  set_fact:
+    post_interfaces_map: >-
+      {%- set m = {} -%}
+      {%- for ln in post_lines_h1 -%}
+        {%- if ln | regex_search('^(Eth|mgmt|Po|Gi|Te|Hu|Lo)') -%}
+          {%- set toks = ln | regex_findall('\S+') -%}
+          {%- if (toks|length) >= 4 -%}
+            {%- set port = toks[0] -%}
+
+            {%- set cand = [] -%}
+            {%- for i in range(1, toks|length) -%}
+              {%- set tk = (toks[i] | lower) -%}
+              {%- if (tk in status_vocab) or (tk | regex_search('^xcvr|^sfp')) -%}
+                {%- set _ = cand.append(i) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set st_idx = (cand[0] if (cand|length) > 0 else -1) -%}
+
+            {%- if st_idx != -1 -%}
+              {%- set status_raw = toks[st_idx] | lower -%}
+              {%- set vlan_raw   = (toks[st_idx+1] | default('')) | lower -%}
+              {%- set duplex     = (toks[st_idx+2] | default('')) | lower -%}
+              {%- set speed      = (toks[st_idx+3] | default('')) | lower -%}
+              {%- set type_val   = (toks[st_idx+4:] | join(' ') ) -%}
+
+              {%- set status_norm = (
+                    (status_raw ~ ' ' ~ vlan_raw)
+                    | regex_findall('(?i)^(connected)\s+(routed|trunk|\d+)$')
+                    | first
+                    | default([])
+                ) -%}
+              {%- if status_norm and (status_norm|length) == 2 -%}
+                {%- set status = status_norm[0] | lower -%}
+                {%- set vlan   = status_norm[1] | lower -%}
+              {%- else -%}
+                {%- set status = status_raw -%}
+                {%- set vlan   = vlan_raw -%}
+              {%- endif -%}
+
+              {%- if status | regex_search('(?i)^xcvr') -%}{%- set status = 'xcvrabsent' -%}{%- endif -%}
+              {%- if status | regex_search('(?i)^sfp')  -%}{%- set status = 'sfpabsent'  -%}{%- endif -%}
+
+              {%- set _ = m.update({
+                    port: {
+                      'port': port, 'status': status,
+                      'vlan': vlan, 'duplex': duplex, 'speed': speed, 'type': type_val
+                    }
+                  }) -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ m }}
+
+- name: POST | Save snapshot (h1)
+  when: save_snapshot_files | default(false) | bool
+  delegate_to: localhost
+  ansible.builtin.copy:
+    dest: "{{ report_dir }}/{{ h1 }}_post_interfaces.json"
+    content: "{{ hostvars[h1].post_interfaces_map | to_nice_json }}"
+
+################################
+# DIFF (connected-only) & ASSERT
+################################
+
+- name: DIFF | Compute interface diffs (h0) — connected-only, ignore descriptions
+  delegate_to: "{{ h0 }}"
+  delegate_facts: true
+  set_fact:
+    pre_connected_map: >-
+      {{
+        (pre_interfaces_map | default({}))
+        | dict2items
+        | selectattr('value.status', 'equalto', 'connected')
+        | items2dict(key_name='key', value_name='value')
+      }}
+    post_connected_map: >-
+      {{
+        (post_interfaces_map | default({}))
+        | dict2items
+        | selectattr('value.status', 'equalto', 'connected')
+        | items2dict(key_name='key', value_name='value')
+      }}
+    pre_connected_list: "{{ pre_connected_map.keys() | list }}"
+    post_connected_list: "{{ post_connected_map.keys() | list }}"
+    if_missing_after: "{{ pre_connected_list | difference(post_connected_list) }}"
+    if_new_after: "{{ post_connected_list | difference(pre_connected_list) }}"
+    if_common: "{{ pre_connected_list | intersect(post_connected_list) }}"
+    if_changed: >-
+      {%- set lst = [] -%}
+      {%- for ifn in if_common -%}
+        {%- set pre = pre_connected_map.get(ifn, {}) -%}
+        {%- set post = post_connected_map.get(ifn, {}) -%}
+        {%- set delta = {} -%}
+        {%- for k in ['vlan','speed','type'] -%}
+          {%- if pre.get(k) != post.get(k) -%}
+            {%- set _ = delta.update({ k: {'before': pre.get(k,'n/a'), 'after': post.get(k,'n/a')} }) -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- if delta | length > 0 -%}
+          {%- set _ = lst.append({'interface': ifn, 'changes': delta}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ lst }}
+    interface_diff_summary: |-
+      Host: {{ h0 }}
+      Missing (were connected pre, not connected post): {{ if_missing_after | join(', ') if if_missing_after|length>0 else 'none' }}
+      New (not connected pre, connected post): {{ if_new_after | join(', ') if if_new_after|length>0 else 'none' }}
+      Changed attributes among still-connected (vlan/speed/type):
+      {% if if_changed|length == 0 %}
+        none
+      {% else %}
+      {% for d in if_changed %}
+        - {{ d.interface }}:
+          {% for k,ch in d.changes.items() %}
+            {{ k }}: {{ ch.before }} -> {{ ch.after }}
+          {% endfor %}
+      {% endfor %}
+      {% endif %}
+
+- name: DIFF | Compute interface diffs (h1) — connected-only, ignore descriptions
+  delegate_to: "{{ h1 }}"
+  delegate_facts: true
+  set_fact:
+    pre_connected_map: >-
+      {{
+        (pre_interfaces_map | default({}))
+        | dict2items
+        | selectattr('value.status', 'equalto', 'connected')
+        | items2dict(key_name='key', value_name='value')
+      }}
+    post_connected_map: >-
+      {{
+        (post_interfaces_map | default({}))
+        | dict2items
+        | selectattr('value.status', 'equalto', 'connected')
+        | items2dict(key_name='key', value_name='value')
+      }}
+    pre_connected_list: "{{ pre_connected_map.keys() | list }}"
+    post_connected_list: "{{ post_connected_map.keys() | list }}"
+    if_missing_after: "{{ pre_connected_list | difference(post_connected_list) }}"
+    if_new_after: "{{ post_connected_list | difference(pre_connected_list) }}"
+    if_common: "{{ pre_connected_list | intersect(post_connected_list) }}"
+    if_changed: >-
+      {%- set lst = [] -%}
+      {%- for ifn in if_common -%}
+        {%- set pre = pre_connected_map.get(ifn, {}) -%}
+        {%- set post = post_connected_map.get(ifn, {}) -%}
+        {%- set delta = {} -%}
+        {%- for k in ['vlan','speed','type'] -%}
+          {%- if pre.get(k) != post.get(k) -%}
+            {%- set _ = delta.update({ k: {'before': pre.get(k,'n/a'), 'after': post.get(k,'n/a')} }) -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- if delta | length > 0 -%}
+          {%- set _ = lst.append({'interface': ifn, 'changes': delta}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ lst }}
+    interface_diff_summary: |-
+      Host: {{ h1 }}
+      Missing (were connected pre, not connected post): {{ if_missing_after | join(', ') if if_missing_after|length>0 else 'none' }}
+      New (not connected pre, connected post): {{ if_new_after | join(', ') if if_new_after|length>0 else 'none' }}
+      Changed attributes among still-connected (vlan/speed/type):
+      {% if if_changed|length == 0 %}
+        none
+      {% else %}
+      {% for d in if_changed %}
+        - {{ d.interface }}:
+          {% for k,ch in d.changes.items() %}
+            {{ k }}: {{ ch.before }} -> {{ ch.after }}
+          {% endfor %}
+      {% endfor %}
+      {% endif %}
+
+- name: ASSERT | No interface regressions (both peers)
+  block:
+    - name: ASSERT | {{ h0 }} — pre-connected are back and unchanged
+      delegate_to: "{{ h0 }}"
+      assert:
+        that:
+          - (hostvars[h0].if_missing_after | default([])) | length == 0
+          - (hostvars[h0].if_changed      | default([])) | length == 0
+        fail_msg: >-
+          Interface regressions detected on {{ h0 }}:
+          {{ hostvars[h0].interface_diff_summary | default('no summary') }}
+
+    - name: ASSERT | {{ h1 }} — pre-connected are back and unchanged
+      delegate_to: "{{ h1 }}"
+      assert:
+        that:
+          - (hostvars[h1].if_missing_after | default([])) | length == 0
+          - (hostvars[h1].if_changed      | default([])) | length == 0
+        fail_msg: >-
+          Interface regressions detected on {{ h1 }}:
+          {{ hostvars[h1].interface_diff_summary | default('no summary') }}
+  rescue:
+    - name: Publish | failing pair diff artifacts
+      run_once: true
+      delegate_to: localhost
+      ansible.builtin.set_stats:
+        data:
+          "{{ pair.key }}_h0_diff": "{{ hostvars[h0].interface_diff_summary | default('n/a') }}"
+          "{{ pair.key }}_h1_diff": "{{ hostvars[h1].interface_diff_summary | default('n/a') }}"
+    - name: Abort | stop further pairs (halt_on_failure)
+      when: halt_on_failure | bool
+      fail:
+        msg: "Halting after pair {{ pair.key }} interface regression (halt_on_failure=true)."
+
+- name: Publish | pair diff artifacts (success path)
+  run_once: true
+  delegate_to: localhost
+  ansible.builtin.set_stats:
+    data:
+      "{{ pair.key }}_h0_diff": "{{ hostvars[h0].interface_diff_summary | default('n/a') }}"
+      "{{ pair.key }}_h1_diff": "{{ hostvars[h1].interface_diff_summary | default('n/a') }}"
+
+- name: Mark | append processed pair
+  run_once: true
+  delegate_to: localhost
+  set_fact:
+    processed_pairs: "{{ (processed_pairs | default([])) + [pair.key] }}"
