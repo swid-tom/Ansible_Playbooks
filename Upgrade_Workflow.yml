@@ -204,7 +204,17 @@
     system_image_file: "{{ nxos_image }}"
     issu: "{{ issu }}"
 
-- name: Wait for SSH (primary) to return
+- name: Wait for SSH (primary) to go DOWN (device rebooting)
+  delegate_to: localhost
+  vars:
+    target_ip: "{{ hostvars[primary_host].ansible_host | default(primary_host) }}"
+  ansible.builtin.wait_for:
+    host: "{{ target_ip }}"
+    port: 22
+    timeout: 300
+    state: stopped
+
+- name: Wait for SSH (primary) to return (device back online)
   delegate_to: localhost
   vars:
     target_ip: "{{ hostvars[primary_host].ansible_host | default(primary_host) }}"
@@ -218,8 +228,16 @@
   ansible.builtin.pause:
     seconds: "{{ settle_seconds }}"
 
-- name: Health wait | primary vPC convergence
-  delegate_to: "{{ primary_host }}"
+# The secondary connection may have gone idle during the primary reboot cycle.
+# Reset it before polling to avoid "Failed to write to ssh channel" errors.
+- name: Reset | refresh idle SSH connection to secondary before health check
+  delegate_to: "{{ secondary_host }}"
+  ansible.builtin.meta: reset_connection
+
+# Query vPC health from the secondary (stable, never rebooted) — it can see
+# the peer link recover and avoids any stale-connection issues on the primary.
+- name: Health wait | primary vPC convergence (checked from secondary)
+  delegate_to: "{{ secondary_host }}"
   cisco.nxos.nxos_command:
     commands: ["show vpc"]
   register: post_primary_vpc
@@ -256,7 +274,17 @@
     system_image_file: "{{ nxos_image }}"
     issu: "{{ issu }}"
 
-- name: Wait for SSH (secondary) to return
+- name: Wait for SSH (secondary) to go DOWN (device rebooting)
+  delegate_to: localhost
+  vars:
+    target_ip: "{{ hostvars[secondary_host].ansible_host | default(secondary_host) }}"
+  ansible.builtin.wait_for:
+    host: "{{ target_ip }}"
+    port: 22
+    timeout: 300
+    state: stopped
+
+- name: Wait for SSH (secondary) to return (device back online)
   delegate_to: localhost
   vars:
     target_ip: "{{ hostvars[secondary_host].ansible_host | default(secondary_host) }}"
@@ -270,8 +298,16 @@
   ansible.builtin.pause:
     seconds: "{{ settle_seconds }}"
 
-- name: Health wait | secondary vPC convergence
-  delegate_to: "{{ secondary_host }}"
+# The primary connection may have gone idle during the secondary reboot cycle.
+# Reset it before polling to avoid "Failed to write to ssh channel" errors.
+- name: Reset | refresh idle SSH connection to primary before health check
+  delegate_to: "{{ primary_host }}"
+  ansible.builtin.meta: reset_connection
+
+# Query vPC health from the primary (already recovered, stable connection) —
+# avoids stale-connection issues on the just-rebooted secondary.
+- name: Health wait | secondary vPC convergence (checked from primary)
+  delegate_to: "{{ primary_host }}"
   cisco.nxos.nxos_command:
     commands: ["show vpc"]
   register: post_secondary_vpc
