@@ -1,230 +1,135 @@
-# Ansible Tower Playbooks
+# Cisco Ansible Playbooks
 
-This repository contains Ansible playbooks designed to run in Ansible Tower/AWX for Cisco network device automation.
+Playbooks in this repository automate common tasks on Cisco IOS and NX-OS
+devices. They are designed to run from Ansible Automation Platform (AAP),
+Ansible Tower, or AWX.
 
-## Playbooks
+## Repository layout
 
-### `cisco_backup.yml`
-Automated backup of Cisco device configurations with Git version control.
-- Backs up running configs from IOS and NX-OS devices
-- Commits backups to GitLab with date-stamped commits
-- Stores configs in Git Repository in `backups/cisco/ios/` and `backups/cisco/nxos/`
+```text
+collections/
+  requirements.yml
+playbooks/
+  cisco/
+    Cisco_ACL_Update.yml
+    cisco_backup.yml
+    network_test.yml
+  nexus/
+    Main_Nexus_Upgrader.yml
+    Upgrade_Workflow.yml
+    Nexus_image_upload.yml
+    Nexus_bootflash_cleanup.yml
+```
 
-### `Nexus_image_upload.yml`
-Stages NX-OS and EPLD images on Nexus switches via SFTP/SCP.
-- Supports Tower Survey variables for flexible deployment
-- MD5 verification before and after transfer
-- Skips upload if same or newer version already exists
-- Optional EPLD image staging
-- Processes 2 switches at a time (serial execution)
-- Serial execution for 2 switches at a time (can change to a variable for survey)
+In AAP, add this repository as a Project and select a playbook from its path
+under `playbooks/`. `Upgrade_Workflow.yml` is a helper used by
+`Main_Nexus_Upgrader.yml`; run the main playbook, not the helper, for an
+upgrade.
 
-**Survey Variables:**
-- `survey_hosts` - Target hosts
-- `nxos_image_filename` - NX-OS image filename
-- `expected_md5` - Expected MD5 checksum
-- `upload_epld` - Yes/No for EPLD upload
-- `epld_filename` / `epld_md5` - EPLD details (if enabled)
-- SFTP server credentials (Ansible Vault)
+## Before you run a job
 
-### `network_test.yml`
-Basic connectivity validation and fact gathering for NX-OS devices.
-- Gathers device facts
-- Runs `show interface status`
+- Add the required questions as an AAP **Survey** on the job template. Playbook
+  variables do not automatically show up as launch prompts.
+- Configure inventory, device credentials, and network access in AAP. Set
+  `ansible_network_os` for network devices, such as `cisco.nxos.nxos` or
+  `cisco.ios.ios`.
+- Keep passwords and tokens in AAP credentials or secret survey fields, not in
+  the repository.
+- AAP can install collections listed in `collections/requirements.yml` when it
+  syncs the Project. The execution environment also needs the required network
+  connection dependencies.
 
-### `Nexus_bootflash_cleanup.yml`
-Deletes old NX-OS and EPLD images on Nexus switches.
-- Checks current version of switch and keeps current and one version behind of NXOS image
-- Only keeps the most current version of EPLD found
-- Defaults to a "Dry Run" - shows what it would delete without deleting.
+## Choose a playbook
 
-**Survey Variables:**
-- `survey_hosts` - Target hosts
-- `dry_run` - Yes/No for a dryrun
-- `Keep only Current NXOS Bin?` - If you just want to keep the current version bin, else it will keep current and one version older
+### Nexus pair upgrade — `playbooks/nexus/Main_Nexus_Upgrader.yml`
 
-## Collections Required
-- `cisco.ios`
-- `cisco.nxos`
-- `ansible.netcommon`
+Upgrades vPC pairs one pair at a time: the primary first, then the secondary.
+It checks recovery and vPC health, creates a report, and can email or publish
+the report to Git.
 
----
-# Nexus vPC Pair Upgrade Playbooks
+Add these Survey questions:
 
-This workspace contains Ansible playbooks to discover Nexus vPC pairs, validate pair/role integrity, run a primary-first upgrade workflow, and publish a detailed report.
+| Variable | What to enter |
+|---|---|
+| `survey_hosts` | Inventory pattern containing both switches in each pair |
+| `nxos_image_filename` | NX-OS image to install |
+| `epld_value` | `true` or `false` |
+| `epld_filename` | EPLD image; needed when `epld_value` is true |
+| `issu_enabled` | `true` or `false` |
 
-## Files
+Email and Git publishing are enabled by the playbook defaults. Before running,
+either set `send_email_report` and `git_publish_report` to `false`, or provide
+valid SMTP settings (`smtp_host`, `mail_from`, `mail_to`) and Git settings
+(`git_reports_repo_url`, `git_user_name`, `git_user_password`). Store the Git
+password as a secret. The checked-in SMTP and Git destinations are examples
+and must be replaced with your environment's values. To publish snapshot
+files, enable both `git_publish_snapshots` and `save_snapshot_files`.
 
-- `Main_Nexus_Upgrader.yml`
-  - Main orchestration playbook.
-  - Discovers vPC pair relationships from `show vpc role`.
-  - Validates reciprocal pairing and primary/secondary role mapping.
-  - Saves running config before upgrades.
-  - Runs per-pair workflow using `Upgrade_Workflow.yml`.
-  - Generates final report and can optionally publish to Git and/or email.
+### Stage Nexus images — `playbooks/nexus/Nexus_image_upload.yml`
 
-- `Upgrade_Workflow.yml`
-  - Per-pair workflow.
-  - Captures PRE interface status snapshots.
-  - Upgrades primary first, verifies recovery and vPC convergence.
-  - Upgrades secondary, verifies recovery and vPC convergence.
-  - Captures POST snapshots.
-  - Computes connected-only diffs and asserts no regressions.
+Copies an NX-OS image from an SFTP/SCP server to bootflash and checks its MD5.
+It can also stage an EPLD image. It does not install either image.
 
-- `collections/requirements.yml`
-  - Declares required collection:
-    - `community.general` (used for SMTP mail task).
+Survey questions:
 
-- `ansible.cfg`
-  - Connection timeout tuning used by this workflow.
+- `survey_hosts` — Nexus devices to target
+- `nxos_image_filename`, `expected_md5` — NX-OS image and its MD5
+- `image_dir_on_sftp`, `sftp_server` — image location and server
+- `sftp_username`, `sftp_password` — server credentials; make the password secret
+- `upload_epld` — `yes` or `no`
+- `epld_filename`, `epld_md5`, `epld_dir_on_sftp` — needed when EPLD is enabled
 
-## High-level Workflow
+The image directory is joined directly to the filename, so include a trailing
+slash. The playbook works on two switches at a time.
 
-1. Discover each device role and local/peer vPC MAC.
-2. Build reciprocal pairs controller-side.
-3. Validate each pair has exactly one primary and one secondary.
-4. Save running config to startup config on all hosts.
-5. Process each pair sequentially:
-   - PRE snapshots
-   - Primary upgrade + recovery checks
-   - Secondary upgrade + recovery checks
-   - POST snapshots
-   - Diff/assert
-6. Build a consolidated report.
-7. Optionally push artifacts to Git.
-8. Optionally email the report.
+### Clean Nexus bootflash — `playbooks/nexus/Nexus_bootflash_cleanup.yml`
 
-## Prerequisites
+Lists old NX-OS/EPLD images and, when asked, deletes them. It keeps the current
+NX-OS image and one older version by default, plus the newest EPLD image.
 
-- Ansible control environment with network connectivity to Nexus devices.
-- Inventory/credentials for `ansible.netcommon.network_cli` access.
-- Cisco collection support for NX-OS modules used by playbooks.
-- Community collection for mail support:
+Survey questions:
+
+- `survey_hosts` — Nexus devices to target
+- `dry_run` — `yes` to preview; set to `no` to delete
+- `keep_only_current` — `yes` to keep only the current NX-OS image
+
+Review the deletion candidates before setting `dry_run` to `no`.
+
+### Update an ACL — `playbooks/cisco/Cisco_ACL_Update.yml`
+
+Updates or deletes a named IPv4 ACL on IOS or NX-OS. It previews changes by
+default; live replacement and deletion each require a separate confirmation.
+
+Survey questions:
+
+- `survey_hosts` — IOS or NX-OS devices to target
+- `acl_config_text` — ACL header and numbered rules, entered as a Textarea
+- `acl_delete` — `true` to delete the ACL; otherwise update it
+- `acl_dry_run` — defaults to `true`; set to `false` for a live update
+- `acl_state` — `merged` (default) or `replaced`
+- `acl_replace_confirmed` — set to `true` only after reviewing a Check run
+- `acl_delete_confirmed` — set to `true` to allow a live deletion
+
+For deletion, enter only the ACL header. For replacement, include the complete
+desired ACL. The playbook does not back up or roll back changes. It saves the
+running configuration by default; `acl_save` can be set to `false`.
+
+### Back up Cisco configs — `playbooks/cisco/cisco_backup.yml`
+
+Backs up IOS and NX-OS configurations and pushes them to Git. The playbook
+still contains a `<<GIT_URL>>` placeholder, which must be replaced before use.
+It targets `all`, so limit the AAP inventory to the devices you intend to back
+up. Configure credentials in AAP.
+
+### Test NX-OS connectivity — `playbooks/cisco/network_test.yml`
+
+Runs fact gathering and `show interface status` on the `nxos` inventory group.
+It has no Survey inputs.
+
+## Collections
+
+Install the project's collections with:
 
 ```bash
 ansible-galaxy collection install -r collections/requirements.yml
 ```
-
-If running in AAP/AWX execution environments, ensure project collection install is enabled or pre-bake required collections.
-
-## Key Variables
-
-Most important runtime inputs are defined in `Main_Nexus_Upgrader.yml` and should typically be overridden via AAP Survey or extra vars.
-
-### Targeting and Images
-
-- `survey_hosts`: host pattern to run against.
-- `nxos_image_filename`: NX-OS image.
-- `epld_value`: set true/1 to include EPLD install path.
-- `epld_filename`: EPLD image (required when EPLD path is enabled).
-- `issu_enabled`: ISSU toggle for standard install module path.
-
-### Upgrade and Recovery Timing
-
-- `wait_timeout_sec`: max time for SSH return after reboot.
-- `settle_seconds`: extra pause after SSH return before health checks.
-- `halt_on_failure`: stop remaining pairs after first failed pair.
-
-### Report Options
-
-- `report_dir`: output directory on controller/EE.
-- `report_snapshot_view`: `table` or `json` representation in report.
-- `save_snapshot_files`: save per-host PRE/POST snapshot files.
-
-### Email Options
-
-- `send_email_report`: enable/disable email send.
-- `smtp_host`: required when email is enabled.
-- `smtp_port`: default 25.
-- `mail_from`, `mail_to`: required when email is enabled.
-- `smtp_user`, `smtp_password`: optional.
-  - Leave empty for unauthenticated relay (typical port 25).
-  - Provide for authenticated SMTP.
-
-### Git Publish Options
-
-- `git_publish_report`: enable/disable Git publishing.
-- `git_reports_repo_url`: target repo URL.
-- `git_reports_repo_path`: local clone path.
-- `git_reports_subdir`: subfolder for report files.
-- `git_publish_snapshots`: include snapshot JSON files.
-- `git_snapshots_subdir`: subfolder for snapshot files.
-- `git_branch`: target branch.
-- `gitlabuser`, `gitlabpassword`: credentials.
-
-## Run Examples
-
-### Run directly with ansible-playbook
-
-```bash
-ansible-playbook -i inventory Main_Nexus_Upgrader.yml \
-  -e "survey_hosts=nexus_pair_group" \
-  -e "nxos_image_filename=nxos.9.3.11.bin" \
-  -e "epld_value=false" \
-  -e "issu_enabled=false"
-```
-
-### Example: enable email without SMTP auth (port 25 relay)
-
-```bash
-ansible-playbook -i inventory Main_Nexus_Upgrader.yml \
-  -e "send_email_report=true" \
-  -e "smtp_host=mail.example.local" \
-  -e "smtp_port=25" \
-  -e "mail_from=netops@example.local" \
-  -e "mail_to=team@example.local" \
-  -e "smtp_user=" \
-  -e "smtp_password="
-```
-
-## Health Check Behavior
-
-After each device upgrade:
-
-1. Waits for TCP/22 (SSH) to return.
-2. Waits an additional settle period.
-3. Retries `show vpc` convergence checks until:
-   - `vPC status : up`
-   - `Peer status : peer adjacency formed`
-
-This avoids false success on simple port reachability and gates progress on actual control-plane convergence.
-
-## Output Artifacts
-
-- Main report:
-  - `{{ report_dir }}/vpc_upgrade_report_<timestamp>.txt`
-- Optional snapshots:
-  - `{{ report_dir }}/<host>_pre_interfaces.json`
-  - `{{ report_dir }}/<host>_post_interfaces.json`
-- Optional set_stats artifacts for AAP job output:
-  - Pair discovery data and per-host diff summaries.
-
-## Troubleshooting
-
-- Pair validation fails:
-  - Confirm all target devices are true vPC peers.
-  - Check `show vpc role` output consistency and inventory scope.
-
-- SSH wait times out:
-  - Increase `wait_timeout_sec` for slower reloads.
-  - Confirm management reachability from control node/EE.
-
-- vPC convergence check fails:
-  - Increase settle or retry windows if control-plane takes longer.
-  - Inspect `show vpc` output from failed host.
-
-- Email task fails with module error:
-  - Ensure `community.general` is installed from `collections/requirements.yml`.
-
-- Git publish fails:
-  - Validate credentials, branch permissions, and repository URL.
-
-## Safety Notes
-
-- This workflow is designed for sequential pair processing to reduce blast radius.
-- Keep `halt_on_failure=true` for conservative change windows.
-- Validate in lab/non-production before production maintenance windows.
-
-
-## Usage
-These playbooks are intended to be run from Ansible Tower/AWX. Configure job templates with appropriate inventories and credentials.
