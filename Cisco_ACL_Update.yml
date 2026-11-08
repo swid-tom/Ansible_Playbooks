@@ -1,0 +1,1015 @@
+---
+# ############################################################################
+# CISCO IOS / NX-OS NAMED IPV4 ACL UPDATE PLAYBOOK
+# ############################################################################
+#
+# PURPOSE:
+#   Update one named IPv4 ACL on Cisco IOS/IOS-XE or NX-OS from an AAP Textarea.
+#   Validate inputs, preview commands, apply
+#   the requested policy, verify convergence, and optionally save to startup.
+#
+# KEY CONCEPTS:
+#   - Platform: Select IOS or NX-OS modules from inventory ansible_network_os
+#   - Named ACL: Derive the name from the pasted header; bindings stay intact
+#   - Operation: Update an ACL or explicitly delete the named ACL
+#   - ACE: Merge input sequence numbers are replaced with 12, 13, ...
+#   - Merged: Preserve unspecified entries, then resequence without reordering
+#   - Replaced: Enforce the full supplied ACL, removing omitted entries
+#   - Check Job: Calculate commands without applying, backing up, or saving
+#   - Dry Run: The acl_dry_run survey option gives Run jobs the same safeguards
+#   - Resequence: After a merge, optionally renumber rules to 10, 20, 30...
+#   - Serial Execution: Process one switch at a time and stop on failure
+#
+# REQUIRED INPUTS (AAP extra vars or inventory host vars):
+#   - acl_config_text: Platform-native IOS or NX-OS IPv4 ACL CLI text
+#   - acl_delete: false (default) updates; true selects deletion
+#   - acl_dry_run: Defaults to true; set false to permit a live Run job
+#   - survey_hosts: Inventory pattern, unless set in template extra vars
+#
+# WORKFLOW:
+#   1. Parse and validate IPv4 ACL text and replacement approval
+#   2. Calculate and display proposed platform commands without applying
+#   3. Apply the requested ACL configuration (live Run jobs only)
+#   4. Verify the requested ACL, using targeted show output for IOS standard ACLs
+#   5. Optionally resequence merged ACLs without changing rule order
+#   6. Optionally save running configuration to startup configuration
+#
+# SAFETY NOTES:
+#   - Changing a bound ACL affects traffic immediately; implicit deny applies
+#   - Replaced requires the complete desired ACL and explicit confirmation
+#   - This playbook does not create backups; handle backup/recovery separately
+#   - Updates are not transactional and no automatic rollback is attempted
+#   - Verification checks configuration, not traffic flow or TCAM programming
+#
+# ############################################################################
+
+- name: Update a named IPv4 ACL on IOS or NX-OS switches
+  hosts: "{{ survey_hosts }}"
+  gather_facts: false
+  connection: ansible.netcommon.network_cli
+  # Number of switches per batch; 1 preserves serial execution.
+  serial: "{{ (acl_batch_size | int) if (acl_batch_size | string) is match('^[1-9][0-9]*$') else 1 }}"
+  any_errors_fatal: true
+
+  vars:
+    # === Connection ===
+    # ansible_network_os is supplied per host by inventory, for example
+    # cisco.ios.ios or cisco.nxos.nxos. SSH credentials come from AAP.
+
+    # === ACL Policy / Replacement Approval ===
+    # Delete mode uses only the ACL header from acl_config_text.
+    acl_delete: false
+    # Internal routing only; expose acl_delete in the AAP survey instead.
+    acl_operation: "{{ 'delete' if (acl_delete | bool) else 'update' }}"
+    # Only IPv4 is accepted. Merge overrides input sequences with consecutive
+    # values beginning at acl_merge_sequence_start.
+    acl_state: merged
+    acl_merge_sequence_start: 12
+    # Set true only after reviewing a Check job with the full replacement ACL.
+    acl_replace_confirmed: false
+    # Live deletion requires its own explicit approval.
+    acl_delete_confirmed: false
+    # Set above 1 to process multiple switches in each batch (bounded by AAP forks).
+    acl_batch_size: 1
+
+    # === Survey Dry Run ===
+    # AAP Multiple Choice answers arrive as strings; bool handles true/false.
+    # Check jobs remain read-only even when this survey answer is false.
+    acl_dry_run: true
+
+    # === Post-Merge Numbering ===
+    # Keep explicit insertion numbers in the input; normalize only after merge.
+    # Replaced jobs retain the supplied numbering. Check/dry-run jobs only preview.
+    acl_resequence: true
+
+    # === Persistence ===
+    # Saving persists the whole running config, including unrelated changes.
+    acl_save: true
+
+  # ========================================================================
+  # PHASE 1: INPUT VALIDATION AND REPLACEMENT APPROVAL
+  # ========================================================================
+  # Reject malformed or empty inputs before making configuration changes.
+  # Merge generates its own numbers; replaced uses the pasted sequence values.
+  # ========================================================================
+  pre_tasks:
+    - name: Validate supported network platform
+      ansible.builtin.assert:
+        that:
+          - ansible_network_os is defined
+          - ansible_network_os in ['cisco.ios.ios', 'cisco.nxos.nxos']
+        fail_msg: >-
+          Set ansible_network_os in inventory to cisco.ios.ios or
+          cisco.nxos.nxos for every target host.
+
+    # --- Validate the survey text and reject ambiguous toggle values ---
+    - name: Validate survey inputs
+      ansible.builtin.assert:
+        that:
+          - acl_config_text is defined
+          - acl_config_text is string
+          - acl_config_text | trim | length > 0
+          - (acl_delete | string | lower) in ['true', 'false']
+          - acl_operation in ['update', 'delete']
+          - (acl_operation == 'delete') == (acl_delete | bool)
+          - acl_operation == 'delete' or acl_state in ['merged', 'replaced']
+          - (acl_dry_run | string | lower) in ['true', 'false']
+          - (acl_replace_confirmed | string | lower) in ['true', 'false']
+          - (acl_delete_confirmed | string | lower) in ['true', 'false']
+          - (acl_resequence | string | lower) in ['true', 'false']
+          - (acl_batch_size | string) is match('^[1-9][0-9]*$')
+        fail_msg: >-
+          Supply acl_config_text using an AAP Textarea. Set acl_delete to
+          true/false, use true/false for confirmation and toggle vars, and
+          set acl_batch_size to a positive integer. Remove the old acl_operation
+          survey/extra var; operation is now derived from acl_delete.
+
+    # --- Accept the platform's IPv4 ACL header followed by numbered ACEs ---
+    # Blank lines and surrounding whitespace are ignored. Do not paste
+    # prompts, interface commands, exit/end, or IPv6 configuration.
+    - name: Validate pasted CLI structure
+      ansible.builtin.assert:
+        that:
+          - acl_input_lines | length >= 1
+          - acl_input_lines[0] is match(acl_header_pattern)
+          - acl_operation != 'delete' or acl_input_lines | length == 1
+          - >-
+            acl_operation == 'delete' or
+            (acl_input_lines | length > 1 and
+            (acl_input_lines[1:] | reject('match',
+            '^[0-9]+ (permit|deny|remark) .+$') | list | length) == 0)
+        fail_msg: >-
+          For NX-OS, use 'ip access-list NAME'. For IOS, use
+          'ip access-list standard NAME' or 'ip access-list extended NAME'.
+          Update requires numbered permit/deny/remark lines; delete requires
+          only the platform-specific header. IPv6 and other commands are rejected.
+      vars:
+        acl_input_lines: "{{ acl_config_text.splitlines() | map('trim') | reject('equalto', '') | list }}"
+        acl_header_pattern: >-
+          {{ '^ip access-list [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$'
+             if ansible_network_os == 'cisco.nxos.nxos'
+             else '^ip access-list (standard|extended) [A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$' }}
+
+    - name: Extract target ACL name from the validated header
+      ansible.builtin.set_fact:
+        acl_target_name: "{{ acl_input_lines[0] | regex_replace('^ip access-list (?:(?:standard|extended) )?', '') }}"
+        acl_target_type: "{{ (acl_input_lines[0] | regex_findall('^ip access-list (standard|extended) ') | first) if ansible_network_os == 'cisco.ios.ios' else '' }}"
+      vars:
+        acl_input_lines: "{{ acl_config_text.splitlines() | map('trim') | reject('equalto', '') | list }}"
+
+    # --- Parse IOS standard ACL entries into the ios_acls resource schema ---
+    - name: Initialize IOS standard ACL entries
+      ansible.builtin.set_fact:
+        acl_standard_aces: []
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+        - acl_target_type == 'standard'
+
+    - name: Validate IOS standard ACL entry syntax
+      ansible.builtin.assert:
+        that:
+          - acl_standard_line_match | from_json | length == 9
+        fail_msg: >-
+          Unsupported IOS standard ACL line: {{ item }}. Use a numbered permit,
+          deny, or remark with any, host ADDRESS, ADDRESS [WILDCARD], or a bare
+          host address, with optional log on permit/deny entries.
+          Parsed captures: {{ acl_standard_line_match }}
+      vars:
+        acl_standard_line_pattern: >-
+          ^([0-9]+)\s+(?:(permit|deny)\s+(?:(any)|(host)\s+((?:[0-9]{1,3}\.){3}[0-9]{1,3})|((?:[0-9]{1,3}\.){3}[0-9]{1,3})(?:\s+((?:[0-9]{1,3}\.){3}[0-9]{1,3}))?)(?:\s+(log))?|remark\s+(.+))$
+        acl_standard_line_match: "{{ item | regex_findall(acl_standard_line_pattern) | first | default([]) | to_json }}"
+      loop: "{{ (acl_config_text.splitlines() | map('trim') | reject('equalto', '') | list)[1:] }}"
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+        - acl_target_type == 'standard'
+
+    - name: Build IOS standard ACL entries
+      ansible.builtin.set_fact:
+        acl_standard_aces: >-
+          {{ acl_standard_aces +
+             [
+               {'sequence': (acl_standard_line_match | from_json)[0] | int}
+               | combine(
+                   {'remarks': [(acl_standard_line_match | from_json)[8]]}
+                   if (acl_standard_line_match | from_json)[8]
+                   else {
+                     'grant': (acl_standard_line_match | from_json)[1],
+                     'source':
+                       {'any': true} if (acl_standard_line_match | from_json)[2] == 'any'
+                       else {'host': (acl_standard_line_match | from_json)[4]} if (acl_standard_line_match | from_json)[3] == 'host'
+                       else {'address': (acl_standard_line_match | from_json)[5], 'wildcard_bits': (acl_standard_line_match | from_json)[6]} if (acl_standard_line_match | from_json)[6]
+                       else {'host': (acl_standard_line_match | from_json)[5]}
+                   }
+                 )
+               | combine({'log': {'set': true}} if (acl_standard_line_match | from_json)[7] == 'log' else {})
+             ] }}
+      vars:
+        acl_standard_line_pattern: >-
+          ^([0-9]+)\s+(?:(permit|deny)\s+(?:(any)|(host)\s+((?:[0-9]{1,3}\.){3}[0-9]{1,3})|((?:[0-9]{1,3}\.){3}[0-9]{1,3})(?:\s+((?:[0-9]{1,3}\.){3}[0-9]{1,3}))?)(?:\s+(log))?|remark\s+(.+))$
+        acl_standard_line_match: "{{ item | regex_findall(acl_standard_line_pattern) | first | to_json }}"
+      loop: "{{ (acl_config_text.splitlines() | map('trim') | reject('equalto', '') | list)[1:] }}"
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+        - acl_target_type == 'standard'
+
+    - name: Set parsed IOS standard ACL structure
+      ansible.builtin.set_fact:
+        acl_parsed:
+          parsed:
+            - afi: ipv4
+              acls:
+                - name: "{{ acl_target_name }}"
+                  acl_type: standard
+                  aces: "{{ acl_standard_aces }}"
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+        - acl_target_type == 'standard'
+
+    # --- Parse with the platform resource module before configuration changes ---
+    - name: Parse pasted IOS ACL into structured configuration
+      cisco.ios.ios_acls:
+        running_config: >-
+          {{ acl_config_text | trim
+             | regex_replace('(?im)^ip access-list extended ', 'Extended IP access list ') }}
+        state: parsed
+      register: acl_parsed_ios
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+        - acl_target_type == 'extended'
+
+    - name: Parse pasted NX-OS ACL into structured configuration
+      cisco.nxos.nxos_acls:
+        running_config: "{{ acl_config_text | trim }}"
+        state: parsed
+      register: acl_parsed_nxos
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.nxos.nxos'
+
+    - name: Select parsed ACL result for the target platform
+      ansible.builtin.set_fact:
+        acl_parsed: "{{ acl_parsed_ios if ansible_network_os == 'cisco.ios.ios' else acl_parsed_nxos }}"
+      when:
+        - acl_operation == 'update'
+        - >-
+          ansible_network_os == 'cisco.nxos.nxos'
+          or (ansible_network_os == 'cisco.ios.ios' and acl_target_type == 'extended')
+
+    - name: Require one nonempty parsed IPv4 ACL
+      ansible.builtin.assert:
+        that:
+          - acl_parsed.parsed | length == 1
+          - acl_parsed.parsed[0].afi == 'ipv4'
+          - acl_parsed.parsed[0].acls | length == 1
+          - acl_parsed.parsed[0].acls[0].aces | default([]) | length > 0
+        fail_msg: >-
+          The parser must produce exactly one nonempty IPv4 ACL.
+          Platform={{ ansible_network_os }}; parsed result count={{ acl_parsed.parsed | length }};
+          parsed result={{ acl_parsed.parsed | to_nice_json }}
+      when: acl_operation == 'update'
+
+    # --- Fail closed if parsing drops unknown options or entire rules ---
+    # Rendering must reproduce the input apart from whitespace and line order.
+    # IPv4 /32 endpoints are equivalent to the renderer's 'host ADDRESS' form.
+    # IOS standard ACL hosts and 'any' are expanded to equivalent canonical forms.
+    # Other noncanonical CLI is rejected; review the suggested form before use.
+    - name: Render parsed IOS ACL for lossless input validation
+      cisco.ios.ios_acls:
+        config: "{{ acl_parsed.parsed }}"
+        state: rendered
+      register: acl_rendered_ios
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+
+    - name: Render parsed NX-OS ACL for lossless input validation
+      cisco.nxos.nxos_acls:
+        config: "{{ acl_parsed.parsed }}"
+        state: rendered
+      register: acl_rendered_nxos
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.nxos.nxos'
+
+    - name: Select rendered ACL result for the target platform
+      ansible.builtin.set_fact:
+        acl_rendered: "{{ acl_rendered_ios if ansible_network_os == 'cisco.ios.ios' else acl_rendered_nxos }}"
+      when: acl_operation == 'update'
+
+    - name: Reject unsupported or noncanonical ACL syntax
+      ansible.builtin.assert:
+        that:
+          - acl_original_lines == acl_rendered_lines
+        fail_msg: >-
+          The parser did not reproduce the pasted ACL exactly. No switch
+          changes have been attempted. Check for unsupported syntax or
+          noncanonical formatting. Input-only lines:
+          {{ acl_original_lines | difference(acl_rendered_lines) }}.
+          Rendered-only lines:
+          {{ acl_rendered_lines | difference(acl_original_lines) }}.
+          Review this rendered form against your intended policy before
+          correcting the input: {{ acl_rendered.rendered }}
+      vars:
+        acl_standard_host_pattern: '^([0-9]+ (?:permit|deny)) ((?:[0-9]{1,3}\.){3}[0-9]{1,3})( log)?$'
+        acl_standard_host_replacement: '\1 host \2\3'
+        acl_host_prefix_pattern: '^([0-9]+ (?:permit|deny) .*) ([0-9]{1,3}(?:\.[0-9]{1,3}){3})/32(?= |$)'
+        acl_host_prefix_replacement: '\1 host \2'
+        # Normalize up to two endpoints per ACE, without changing remark text.
+        acl_original_lines: >-
+          {{ acl_config_text.splitlines() | map('trim') | reject('equalto', '')
+             | map('regex_replace', '\s+', ' ')
+             | map('regex_replace', acl_standard_host_pattern, acl_standard_host_replacement)
+             | map('regex_replace', acl_host_prefix_pattern, acl_host_prefix_replacement)
+             | map('regex_replace', acl_host_prefix_pattern, acl_host_prefix_replacement)
+             | sort | list }}
+        acl_rendered_lines: >-
+          {{ acl_rendered.rendered | map('trim') | reject('equalto', '')
+             | map('regex_replace', '\s+', ' ') | sort | list }}
+      when: acl_operation == 'update'
+
+    # --- Replacement mode uses supplied numbers, so validate them ---
+    - name: Validate explicit replacement sequence numbers
+      ansible.builtin.assert:
+        that:
+          - item is mapping
+          - item.sequence is defined
+          - item.sequence is integer
+          - item.sequence >= 1
+          - item.sequence <= 4294967295
+        fail_msg: Each ACL entry requires an integer sequence number from 1 to 4294967295.
+      loop: "{{ acl_parsed.parsed[0].acls[0].aces }}"
+      when:
+        - acl_operation == 'update'
+        - acl_state == 'replaced'
+
+    # --- Replacement input must not repeat sequence numbers ---
+    - name: Reject duplicate replacement sequence numbers
+      ansible.builtin.assert:
+        that:
+          - >-
+            (acl_parsed.parsed[0].acls[0].aces | map(attribute='sequence') | unique | list | length)
+            == (acl_parsed.parsed[0].acls[0].aces | length)
+        fail_msg: ACL entry sequence numbers must be unique.
+      when:
+        - acl_operation == 'update'
+        - acl_state == 'replaced'
+
+    # --- CRITICAL: Replaced removes rules omitted from the pasted ACL ---
+    # Allow Check/dry-run jobs without confirmation to review commands.
+    # Run jobs require approval before enforcing the complete supplied policy.
+    - name: Require approval before replacing an ACL
+      ansible.builtin.assert:
+        that:
+          - >-
+            ansible_check_mode or (acl_dry_run | bool)
+            or acl_state != 'replaced' or (acl_replace_confirmed | bool)
+        fail_msg: >-
+          Replaced removes entries omitted from acl_config_text. Provide the
+          complete desired ACL and set acl_replace_confirmed=true after
+          reviewing a Check job.
+      when: acl_operation == 'update'
+
+    - name: Require confirmation before deleting an ACL
+      ansible.builtin.assert:
+        that:
+          - ansible_check_mode or (acl_dry_run | bool) or (acl_delete_confirmed | bool)
+        fail_msg: >-
+          Live ACL deletion requires acl_delete_confirmed=true. Confirm the
+          ACL name and check whether it is referenced by interfaces or VTY lines.
+      when: acl_operation == 'delete'
+
+  tasks:
+    # --- Make the effective execution mode visible in AAP job output ---
+    - name: Display effective execution mode
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'DRY RUN - no apply or save will run'
+             if (ansible_check_mode or (acl_dry_run | bool))
+             else 'LIVE RUN - configuration changes are enabled' }}
+
+    # --- Gather the target ACL so generated merge numbers cannot collide ---
+    - name: Gather existing IOS ACLs before merge
+      cisco.ios.ios_acls:
+        state: gathered
+      register: acl_current_ios
+      when:
+        - acl_operation == 'update'
+        - acl_state == 'merged'
+        - ansible_network_os == 'cisco.ios.ios'
+
+    - name: Gather existing NX-OS ACLs before merge
+      cisco.nxos.nxos_acls:
+        state: gathered
+      register: acl_current_nxos
+      when:
+        - acl_operation == 'update'
+        - acl_state == 'merged'
+        - ansible_network_os == 'cisco.nxos.nxos'
+
+    - name: Select gathered ACL state for the target platform
+      ansible.builtin.set_fact:
+        acl_current_state: "{{ acl_current_ios if ansible_network_os == 'cisco.ios.ios' else acl_current_nxos }}"
+      when:
+        - acl_operation == 'update'
+        - acl_state == 'merged'
+
+    - name: Find the target ACL and its current sequence numbers
+      ansible.builtin.set_fact:
+        acl_current_matches: >-
+          {{ acl_current_state.gathered | selectattr('afi', 'equalto', 'ipv4')
+             | map(attribute='acls') | flatten
+             | selectattr('name', 'equalto', acl_parsed.parsed[0].acls[0].name)
+             | list }}
+      when:
+        - acl_operation == 'update'
+        - acl_state == 'merged'
+
+    - name: Set current and generated sequence numbers
+      ansible.builtin.set_fact:
+        acl_current_sequences: >-
+          {{ (acl_current_matches[0].aces | default([]) | map(attribute='sequence') | list)
+             if (acl_current_matches | length > 0) else [] }}
+        acl_generated_sequences: >-
+          {{ range(acl_merge_sequence_start,
+                   acl_merge_sequence_start + (acl_parsed.parsed[0].acls[0].aces | length))
+             | list }}
+      when:
+        - acl_operation == 'update'
+        - acl_state == 'merged'
+
+    - name: Validate the generated merge sequence range
+      ansible.builtin.assert:
+        that:
+          - acl_merge_sequence_start is integer
+          - acl_merge_sequence_start >= 1
+          - acl_generated_sequences[-1] <= 4294967295
+          - acl_generated_sequences | intersect(acl_current_sequences) | length == 0
+        fail_msg: >-
+          Generated merge sequence numbers {{ acl_generated_sequences }} are
+          invalid or already used by {{ acl_parsed.parsed[0].acls[0].name }}.
+          No ACL changes have been applied. Inspect the current ACL and choose
+          a free starting sequence before retrying.
+      when:
+        - acl_operation == 'update'
+        - acl_state == 'merged'
+
+    # --- Ignore pasted sequence values for merges; preserve rule order ---
+    - name: Initialize generated merge entries
+      ansible.builtin.set_fact:
+        acl_effective_aces: []
+      when:
+        - acl_operation == 'update'
+        - acl_state == 'merged'
+
+    - name: Assign consecutive generated sequence numbers to merge entries
+      ansible.builtin.set_fact:
+        acl_effective_aces: >-
+          {{ acl_effective_aces +
+             [item | combine({'sequence': acl_merge_sequence_start + ansible_loop.index0})] }}
+      loop: "{{ acl_parsed.parsed[0].acls[0].aces }}"
+      loop_control:
+        extended: true
+      when:
+        - acl_operation == 'update'
+        - acl_state == 'merged'
+
+    - name: Keep supplied sequence numbers for replacement
+      ansible.builtin.set_fact:
+        acl_effective_aces: "{{ acl_parsed.parsed[0].acls[0].aces }}"
+      when:
+        - acl_operation == 'update'
+        - acl_state == 'replaced'
+
+    - name: Build effective IOS ACL configuration
+      ansible.builtin.set_fact:
+        acl_effective_config:
+          - afi: ipv4
+            acls:
+              - name: "{{ acl_parsed.parsed[0].acls[0].name }}"
+                acl_type: "{{ acl_target_type }}"
+                aces: "{{ acl_effective_aces }}"
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+
+    - name: Render desired IOS standard ACL for show-command verification
+      cisco.ios.ios_acls:
+        config: "{{ acl_effective_config }}"
+        state: rendered
+      register: acl_standard_expected
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+        - acl_target_type == 'standard'
+
+    - name: Build effective NX-OS ACL configuration
+      ansible.builtin.set_fact:
+        acl_effective_config:
+          - afi: ipv4
+            acls:
+              - name: "{{ acl_parsed.parsed[0].acls[0].name }}"
+                aces: "{{ acl_effective_aces }}"
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.nxos.nxos'
+
+    # ======================================================================
+    # PHASE 2: READ-ONLY CHANGE PREVIEW
+    # ======================================================================
+    # Compare requested policy with live configuration in both Check and Run
+    # jobs. This module invocation never applies the calculated commands.
+    # ======================================================================
+    - name: Calculate proposed IOS ACL changes without applying them
+      cisco.ios.ios_acls:
+        config: "{{ acl_effective_config }}"
+        state: "{{ acl_state }}"
+      check_mode: true
+      register: acl_preview_ios
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+        - not (acl_target_type == 'standard' and acl_state == 'replaced')
+
+    - name: Preview IOS standard ACL replacement using ios_config
+      cisco.ios.ios_config:
+        lines: "{{ acl_standard_expected.rendered[1:] }}"
+        parents: "ip access-list standard {{ acl_target_name }}"
+        before:
+          - "no ip access-list standard {{ acl_target_name }}"
+        match: exact
+      check_mode: true
+      register: acl_preview_ios_standard_replace
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+        - acl_target_type == 'standard'
+        - acl_state == 'replaced'
+
+    - name: Calculate proposed NX-OS ACL changes without applying them
+      cisco.nxos.nxos_acls:
+        config: "{{ acl_effective_config }}"
+        state: "{{ acl_state }}"
+      check_mode: true
+      register: acl_preview_nxos
+      when:
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.nxos.nxos'
+
+    - name: Select ACL preview for the target platform
+      ansible.builtin.set_fact:
+        acl_preview: >-
+          {{ acl_preview_ios_standard_replace
+             if (ansible_network_os == 'cisco.ios.ios'
+                 and acl_target_type == 'standard' and acl_state == 'replaced')
+             else (acl_preview_ios if ansible_network_os == 'cisco.ios.ios'
+                   else acl_preview_nxos) }}
+      when: acl_operation == 'update'
+
+    - name: Calculate proposed IOS ACL deletion without applying it
+      cisco.ios.ios_acls:
+        config:
+          - afi: ipv4
+            acls:
+              - name: "{{ acl_target_name }}"
+                acl_type: "{{ acl_target_type }}"
+        state: deleted
+      check_mode: true
+      register: acl_delete_preview_ios
+      when:
+        - acl_operation == 'delete'
+        - ansible_network_os == 'cisco.ios.ios'
+
+    - name: Calculate proposed NX-OS ACL deletion without applying it
+      cisco.nxos.nxos_acls:
+        config:
+          - afi: ipv4
+            acls:
+              - name: "{{ acl_target_name }}"
+        state: deleted
+      check_mode: true
+      register: acl_delete_preview_nxos
+      when:
+        - acl_operation == 'delete'
+        - ansible_network_os == 'cisco.nxos.nxos'
+
+    - name: Select ACL deletion preview for the target platform
+      ansible.builtin.set_fact:
+        acl_delete_preview: "{{ acl_delete_preview_ios if ansible_network_os == 'cisco.ios.ios' else acl_delete_preview_nxos }}"
+      when: acl_operation == 'delete'
+
+    # --- Publish the proposed commands in AAP job output ---
+    - name: Display proposed commands
+      ansible.builtin.debug:
+        var: acl_preview.commands
+      when: acl_operation == 'update'
+
+    - name: Display proposed ACL deletion commands
+      ansible.builtin.debug:
+        var: acl_delete_preview.commands
+      when: acl_operation == 'delete'
+
+    # --- Resequencing is separate from the resource module's merge preview ---
+    - name: Display conditional post-merge resequence command
+      ansible.builtin.debug:
+        msg: >-
+          Merge input sequence values are ignored; generated entries use
+          {{ acl_generated_sequences }}.
+          After merge verification, run if numbering is not already standard:
+          {{ ('ip access-list resequence ' ~ acl_parsed.parsed[0].acls[0].name ~ ' 10 10') if ansible_network_os == 'cisco.ios.ios' else ('resequence ip access-list ' ~ acl_parsed.parsed[0].acls[0].name ~ ' 10 10') }}.
+          Check/dry-run jobs will not execute this command.
+      when:
+        - acl_operation == 'update'
+        - acl_state == 'merged'
+        - acl_resequence | bool
+
+    - name: Display deletion target
+      ansible.builtin.debug:
+        msg: "Requested ACL for deletion: {{ acl_target_name }}"
+      when: acl_operation == 'delete'
+
+    # ======================================================================
+    # PHASE 3: APPLY THE REQUESTED ACL POLICY
+    # ======================================================================
+    # Manage only the named ACL. Existing interface/VTY bindings stay intact.
+    # A newly created ACL must be bound separately before it filters traffic.
+    # ======================================================================
+    - name: Apply requested IOS ACL configuration
+      cisco.ios.ios_acls:
+        config: "{{ acl_effective_config }}"
+        state: "{{ acl_state }}"
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+        - not (acl_target_type == 'standard' and acl_state == 'replaced')
+
+    - name: Replace IOS standard ACL using a clean config section
+      cisco.ios.ios_config:
+        lines: "{{ acl_standard_expected.rendered[1:] }}"
+        parents: "ip access-list standard {{ acl_target_name }}"
+        before:
+          - "no ip access-list standard {{ acl_target_name }}"
+        match: exact
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+        - acl_target_type == 'standard'
+        - acl_state == 'replaced'
+
+    - name: Apply requested NX-OS ACL configuration
+      cisco.nxos.nxos_acls:
+        config: "{{ acl_effective_config }}"
+        state: "{{ acl_state }}"
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.nxos.nxos'
+
+    - name: Delete requested IOS IPv4 ACL
+      cisco.ios.ios_acls:
+        config:
+          - afi: ipv4
+            acls:
+              - name: "{{ acl_target_name }}"
+                acl_type: "{{ acl_target_type }}"
+        state: deleted
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'delete'
+        - ansible_network_os == 'cisco.ios.ios'
+
+    - name: Delete requested NX-OS IPv4 ACL
+      cisco.nxos.nxos_acls:
+        config:
+          - afi: ipv4
+            acls:
+              - name: "{{ acl_target_name }}"
+        state: deleted
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'delete'
+        - ansible_network_os == 'cisco.nxos.nxos'
+
+    # ======================================================================
+    # PHASE 4: POST-CHANGE ACL VERIFICATION
+    # ======================================================================
+    # Recalculate changes against live configuration without applying them.
+    # A converged policy should require no further commands in the same mode.
+    # ======================================================================
+    - name: Check for remaining IOS ACL differences
+      cisco.ios.ios_acls:
+        config: "{{ acl_effective_config }}"
+        state: "{{ acl_state }}"
+      check_mode: true
+      register: acl_verification_ios
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+        - acl_target_type != 'standard'
+
+    - name: Check for remaining NX-OS ACL differences
+      cisco.nxos.nxos_acls:
+        config: "{{ acl_effective_config }}"
+        state: "{{ acl_state }}"
+      check_mode: true
+      register: acl_verification_nxos
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.nxos.nxos'
+
+    - name: Select ACL verification result for the target platform
+      ansible.builtin.set_fact:
+        acl_verification: "{{ acl_verification_ios if ansible_network_os == 'cisco.ios.ios' else acl_verification_nxos }}"
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'update'
+        - not (ansible_network_os == 'cisco.ios.ios' and acl_target_type == 'standard')
+
+    - name: Read the target IOS standard ACL using a show command
+      cisco.ios.ios_command:
+        commands:
+          - "show ip access-lists {{ acl_target_name }}"
+      register: acl_standard_show
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+        - acl_target_type == 'standard'
+
+    - name: Normalize IOS standard ACL lines for verification
+      ansible.builtin.set_fact:
+        acl_standard_actual_lines: >-
+          {{ acl_standard_show.stdout[0].splitlines()
+             | map('trim') | reject('equalto', '')
+             | map('regex_replace', '\s+', ' ')
+             | map('regex_replace', '^Standard IP access list ', 'ip access-list standard ')
+             | map('regex_replace', '\s+\([0-9,]+ match(?:es)?\)$', '')
+             | map('regex_replace', ', wildcard bits ', ' ')
+             | map('regex_replace', acl_standard_host_pattern, acl_standard_host_replacement)
+             | sort | list }}
+        acl_standard_expected_lines: >-
+          {{ acl_standard_expected.rendered
+             | map('trim') | reject('equalto', '')
+             | map('regex_replace', '\s+', ' ') | sort | list }}
+      vars:
+        acl_standard_host_pattern: '^([0-9]+ (?:permit|deny)) ((?:[0-9]{1,3}\.){3}[0-9]{1,3})( log)?$'
+        acl_standard_host_replacement: '\1 host \2\3'
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'update'
+        - ansible_network_os == 'cisco.ios.ios'
+        - acl_target_type == 'standard'
+
+    - name: Verify merged IOS standard ACL entries are present
+      ansible.builtin.assert:
+        that:
+          - acl_standard_expected_lines | difference(acl_standard_actual_lines) | length == 0
+        fail_msg: >-
+          IOS standard ACL show output is missing requested merged entries.
+          Startup configuration was not saved. ACL={{ acl_target_name }};
+          actual={{ acl_standard_actual_lines | to_nice_json }};
+          expected additions={{ acl_standard_expected_lines | to_nice_json }}.
+          Inspect the switch before retrying; no automatic rollback was attempted.
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'update'
+        - acl_state == 'merged'
+        - ansible_network_os == 'cisco.ios.ios'
+        - acl_target_type == 'standard'
+
+    - name: Verify replaced IOS standard ACL exactly matches requested rules
+      ansible.builtin.assert:
+        that:
+          - acl_standard_actual_lines == acl_standard_expected_lines
+        fail_msg: >-
+          IOS standard ACL show output does not exactly match the requested
+          replacement. Startup configuration was not saved. ACL={{ acl_target_name }};
+          actual={{ acl_standard_actual_lines | to_nice_json }};
+          expected={{ acl_standard_expected_lines | to_nice_json }}.
+          Inspect the switch before retrying; no automatic rollback was attempted.
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'update'
+        - acl_state == 'replaced'
+        - ansible_network_os == 'cisco.ios.ios'
+        - acl_target_type == 'standard'
+
+    - name: Verify requested IOS IPv4 ACL is absent
+      cisco.ios.ios_acls:
+        config:
+          - afi: ipv4
+            acls:
+              - name: "{{ acl_target_name }}"
+                acl_type: "{{ acl_target_type }}"
+        state: deleted
+      check_mode: true
+      register: acl_delete_verification_ios
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'delete'
+        - ansible_network_os == 'cisco.ios.ios'
+
+    - name: Verify requested NX-OS IPv4 ACL is absent
+      cisco.nxos.nxos_acls:
+        config:
+          - afi: ipv4
+            acls:
+              - name: "{{ acl_target_name }}"
+        state: deleted
+      check_mode: true
+      register: acl_delete_verification_nxos
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'delete'
+        - ansible_network_os == 'cisco.nxos.nxos'
+
+    - name: Select ACL deletion verification for the target platform
+      ansible.builtin.set_fact:
+        acl_delete_verification: "{{ acl_delete_verification_ios if ansible_network_os == 'cisco.ios.ios' else acl_delete_verification_nxos }}"
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'delete'
+
+    # --- Stop before saving if the requested policy has not converged ---
+    # Running configuration may already be changed; recovery is manual.
+    - name: Require requested ACL configuration to be present
+      ansible.builtin.assert:
+        that:
+          - not acl_verification.changed
+        fail_msg: >-
+          ACL verification found unapplied differences. Startup configuration
+          was not saved. Platform={{ ansible_network_os }}; ACL={{ acl_target_name }};
+          remaining commands={{ acl_verification.commands | default([]) | to_nice_json }}.
+          Inspect the switch before retrying; no automatic rollback was attempted.
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'update'
+        - not (ansible_network_os == 'cisco.ios.ios' and acl_target_type == 'standard')
+
+    - name: Require requested ACL to be absent before saving
+      ansible.builtin.assert:
+        that:
+          - not acl_delete_verification.changed
+        fail_msg: >-
+          ACL deletion verification found the ACL still present. Startup
+          configuration was not saved; inspect the switch before retrying.
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'delete'
+
+    # ======================================================================
+    # PHASE 5: OPTIONAL POST-MERGE RESEQUENCING
+    # ======================================================================
+    # Verify the merge first because its input sequence numbers change below.
+    # Compare the complete named ACL before/after, ignoring only sequence values.
+    # ======================================================================
+    - name: Normalize merged ACL numbering and verify preserved policy
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_operation == 'update'
+        - acl_state == 'merged'
+        - acl_resequence | bool
+      vars:
+        acl_resequence_name: "{{ acl_parsed.parsed[0].acls[0].name }}"
+        acl_resequence_before_targets: >-
+          {{ acl_before_resequence.gathered | selectattr('afi', 'equalto', 'ipv4')
+             | map(attribute='acls') | flatten
+             | selectattr('name', 'equalto', acl_resequence_name) | list }}
+        acl_resequence_after_targets: >-
+          {{ acl_after_resequence.gathered | selectattr('afi', 'equalto', 'ipv4')
+             | map(attribute='acls') | flatten
+             | selectattr('name', 'equalto', acl_resequence_name) | list }}
+        acl_resequence_before_aces: "{{ acl_resequence_before_targets[0].aces | sort(attribute='sequence') }}"
+        acl_resequence_after_aces: "{{ acl_resequence_after_targets[0].aces | sort(attribute='sequence') }}"
+        acl_resequence_expected: "{{ range(10, ((acl_resequence_before_aces | length) + 1) * 10, 10) | list }}"
+        acl_resequence_before_policy: >-
+          {{ acl_resequence_before_aces | map('dict2items')
+             | map('rejectattr', 'key', 'equalto', 'sequence') | map('list')
+             | map('items2dict') | list }}
+        acl_resequence_after_policy: >-
+          {{ acl_resequence_after_aces | map('dict2items')
+             | map('rejectattr', 'key', 'equalto', 'sequence') | map('list')
+             | map('items2dict') | list }}
+      block:
+        - name: Gather IOS ACLs before resequencing
+          cisco.ios.ios_acls:
+            state: gathered
+          register: acl_before_resequence_ios
+          when: ansible_network_os == 'cisco.ios.ios'
+
+        - name: Gather NX-OS ACLs before resequencing
+          cisco.nxos.nxos_acls:
+            state: gathered
+          register: acl_before_resequence_nxos
+          when: ansible_network_os == 'cisco.nxos.nxos'
+
+        - name: Select pre-resequence ACL state
+          ansible.builtin.set_fact:
+            acl_before_resequence: "{{ acl_before_resequence_ios if ansible_network_os == 'cisco.ios.ios' else acl_before_resequence_nxos }}"
+
+        - name: Require the merged ACL to exist before resequencing
+          ansible.builtin.assert:
+            that:
+              - acl_resequence_before_targets | length == 1
+              - acl_resequence_before_targets[0].aces | default([]) | length > 0
+
+        # Skip each platform command when the ACL is already numbered in tens.
+        - name: Resequence the merged IOS IPv4 ACL starting at 10 in increments of 10
+          cisco.ios.ios_config:
+            lines:
+              - "ip access-list resequence {{ acl_resequence_name }} 10 10"
+            match: none
+          when:
+            - ansible_network_os == 'cisco.ios.ios'
+            - >-
+              (acl_resequence_before_aces | map(attribute='sequence') | list)
+              != acl_resequence_expected
+
+        - name: Resequence the merged NX-OS IPv4 ACL starting at 10 in increments of 10
+          cisco.nxos.nxos_config:
+            lines:
+              - "resequence ip access-list {{ acl_resequence_name }} 10 10"
+            match: none
+          when:
+            - ansible_network_os == 'cisco.nxos.nxos'
+            - >-
+              (acl_resequence_before_aces | map(attribute='sequence') | list)
+              != acl_resequence_expected
+
+        - name: Gather IOS ACLs after resequencing
+          cisco.ios.ios_acls:
+            state: gathered
+          register: acl_after_resequence_ios
+          when: ansible_network_os == 'cisco.ios.ios'
+
+        - name: Gather NX-OS ACLs after resequencing
+          cisco.nxos.nxos_acls:
+            state: gathered
+          register: acl_after_resequence_nxos
+          when: ansible_network_os == 'cisco.nxos.nxos'
+
+        - name: Select post-resequence ACL state
+          ansible.builtin.set_fact:
+            acl_after_resequence: "{{ acl_after_resequence_ios if ansible_network_os == 'cisco.ios.ios' else acl_after_resequence_nxos }}"
+
+        - name: Verify numbering and unchanged ACL rule order and contents
+          ansible.builtin.assert:
+            that:
+              - acl_resequence_after_targets | length == 1
+              - acl_resequence_before_policy == acl_resequence_after_policy
+              - >-
+                (acl_resequence_after_aces | map(attribute='sequence') | list)
+                == acl_resequence_expected
+            fail_msg: >-
+              Post-resequence verification failed. Startup configuration was
+              not saved. Inspect the ACL; no automatic rollback was attempted.
+
+    # ======================================================================
+    # PHASE 6: OPTIONAL STARTUP CONFIGURATION SAVE
+    # ======================================================================
+    # Save only after verification succeeds and only when persistence is on.
+    # This also saves unrelated running changes, even if the ACL was unchanged.
+    # ======================================================================
+    - name: Save verified IOS running configuration if different from startup
+      cisco.ios.ios_config:
+        save_when: modified
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_save | bool
+        - ansible_network_os == 'cisco.ios.ios'
+
+    - name: Save verified NX-OS running configuration if different from startup
+      cisco.nxos.nxos_config:
+        save_when: modified
+      when:
+        - not ansible_check_mode
+        - not (acl_dry_run | bool)
+        - acl_save | bool
+        - ansible_network_os == 'cisco.nxos.nxos'
